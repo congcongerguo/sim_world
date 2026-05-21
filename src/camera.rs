@@ -20,23 +20,15 @@ impl Plugin for CameraPlugin {
 // Systems
 // ---------------------------------------------------------------------------
 
-fn setup_camera(mut commands: Commands, windows: Query<&Window>) {
+fn setup_camera(mut commands: Commands) {
     let center = Vec3::new(
         map::MAP_WIDTH as f32 * map::TILE_SIZE / 2.0,
         map::MAP_HEIGHT as f32 * map::TILE_SIZE / 2.0,
         0.0,
     );
 
-    let world_w = map::MAP_WIDTH as f32 * map::TILE_SIZE;
-    let world_h = map::MAP_HEIGHT as f32 * map::TILE_SIZE;
-
-    // Fit the entire map into the viewport on startup.
-    // In Bevy 0.15, higher scale = larger visible area (more zoomed out).
-    let init_scale = if let Ok(window) = windows.get_single() {
-        (world_w / window.width()).max(world_h / window.height()) * 1.1
-    } else {
-        20.0
-    };
+    // Start zoomed in enough to see individual tiles clearly.
+    let init_scale = 1.0;
 
     commands.spawn((
         Camera2d,
@@ -96,18 +88,17 @@ fn camera_control(
         }
     }
 
-    // --- pan with middle-mouse drag ---
+    // --- pan with left-mouse drag ---
     let Ok(window) = windows.get_single() else {
         return;
     };
     let cursor = window.cursor_position();
 
-    if mouse.pressed(MouseButton::Middle) {
+    if mouse.pressed(MouseButton::Left) {
         if let (Some(pos), Some(last)) = (cursor, pan_state.last_cursor) {
             let delta = pos - last;
-            let inv_scale = 1.0 / projection.scale;
-            transform.translation.x -= delta.x * inv_scale;
-            transform.translation.y += delta.y * inv_scale;
+            transform.translation.x -= delta.x;
+            transform.translation.y += delta.y;
         }
         pan_state.last_cursor = cursor;
     } else {

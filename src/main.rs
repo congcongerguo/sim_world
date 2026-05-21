@@ -1,13 +1,19 @@
+mod actions;
 mod birds;
+mod buildings;
 mod camera;
 mod caves;
 mod clouds;
+mod element_config;
+mod farmland;
 mod features;
 mod generation;
 mod lang;
 mod map;
+mod player;
 mod resources;
 mod sim_rng;
+mod sim_time;
 mod ui;
 mod vegetation;
 
@@ -25,16 +31,15 @@ fn main() {
             }),
         )
         .add_plugins(sim_rng::SimRngPlugin)
+        .add_plugins(actions::ActionPlugin)
         .add_plugins(generation::GenerationPlugin)
         .add_plugins(lang::LangPlugin)
+        .add_plugins(sim_time::SimTimePlugin)
         .add_plugins(map::MapPlugin)
-        .add_plugins(resources::ResourcePlugin)
-        .add_plugins(vegetation::VegetationPlugin)
-        .add_plugins(features::FeaturePlugin)
         .add_plugins(camera::CameraPlugin)
-        .add_plugins(clouds::CloudPlugin)
-        .add_plugins(birds::BirdPlugin)
-        .add_plugins(caves::CavePlugin)
+        .add_plugins(farmland::FarmlandPlugin)
+        .add_plugins(player::CharacterPlugin)
+        .add_plugins(vegetation::VegetationPlugin)
         .add_plugins(ui::UIPlugin)
         .run();
 }

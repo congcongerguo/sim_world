@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::map::{Map, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
+use crate::map::{Map, TileCategory, TileContent, TileEntry, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_rng::SimRng;
 
 const CAVE_Z: f32 = -0.5;
@@ -21,6 +21,7 @@ fn spawn_caves(
     mut commands: Commands,
     map: Res<Map>,
     mut rng: ResMut<SimRng>,
+    mut tile_content: ResMut<TileContent>,
 ) {
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
@@ -50,6 +51,14 @@ fn spawn_caves(
                 GlobalTransform::default(),
                 Visibility::default(),
             ));
+
+            tile_content.data.entry(y * MAP_WIDTH + x).or_default().push(TileEntry {
+                name: "Cave",
+                category: TileCategory::Cave,
+                amount: 0,
+                w: 1,
+                h: 1,
+            });
         }
     }
 }

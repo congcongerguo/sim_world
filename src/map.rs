@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite::Anchor;
 
+use crate::element_config::{Interaction, TERRAIN_CONFIGS};
+
 pub const TILE_SIZE: f32 = 32.0;
-pub const MAP_WIDTH: usize = 1024;
-pub const MAP_HEIGHT: usize = 1024;
+pub const MAP_WIDTH: usize = 100;
+pub const MAP_HEIGHT: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Terrain types
@@ -32,63 +36,6 @@ pub enum TileType {
     Desert = 13,
     Clay = 14,
 }
-
-impl TileType {
-    pub fn name(&self) -> &'static str {
-        match self {
-            TileType::Grass => "Grass",
-            TileType::Water => "Water",
-            TileType::DeepWater => "Deep Water",
-            TileType::Sand => "Sand",
-            TileType::Forest => "Forest",
-            TileType::Swamp => "Swamp",
-            TileType::Stone => "Stone",
-            TileType::Dirt => "Dirt",
-            TileType::Snow => "Snow",
-            TileType::Lava => "Lava",
-            TileType::Tundra => "Tundra",
-            TileType::Ice => "Ice",
-            TileType::Meadow => "Meadow",
-            TileType::Desert => "Desert",
-            TileType::Clay => "Clay",
-        }
-    }
-
-    pub fn color(&self) -> Color {
-        match self {
-            TileType::Grass => Color::srgb(0.30, 0.70, 0.20),
-            TileType::Water => Color::srgb(0.20, 0.35, 0.80),
-            TileType::DeepWater => Color::srgb(0.08, 0.15, 0.50),
-            TileType::Sand => Color::srgb(0.76, 0.70, 0.50),
-            TileType::Forest => Color::srgb(0.10, 0.50, 0.10),
-            TileType::Swamp => Color::srgb(0.25, 0.45, 0.20),
-            TileType::Stone => Color::srgb(0.50, 0.50, 0.50),
-            TileType::Dirt => Color::srgb(0.55, 0.40, 0.25),
-            TileType::Snow => Color::srgb(0.95, 0.95, 0.95),
-            TileType::Lava => Color::srgb(0.80, 0.20, 0.05),
-            TileType::Tundra => Color::srgb(0.60, 0.65, 0.55),
-            TileType::Ice => Color::srgb(0.85, 0.90, 0.95),
-            TileType::Meadow => Color::srgb(0.50, 0.80, 0.25),
-            TileType::Desert => Color::srgb(0.85, 0.75, 0.40),
-            TileType::Clay => Color::srgb(0.65, 0.45, 0.30),
-        }
-    }
-
-    /// Return RGBA bytes for the tile color (sRGB space).
-    fn rgba_bytes(&self) -> [u8; 4] {
-        let c = self.color().to_srgba();
-        [
-            (c.red * 255.0) as u8,
-            (c.green * 255.0) as u8,
-            (c.blue * 255.0) as u8,
-            (c.alpha * 255.0) as u8,
-        ]
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Components
-// ---------------------------------------------------------------------------
 
 /// Marks the single terrain sprite entity.
 #[derive(Component)]
@@ -117,18 +64,41 @@ impl Default for Map {
 }
 
 impl Map {
-    pub fn get(&self, x: usize, y: usize) -> Option<&TileType> {
-        if x < self.width && y < self.height {
-            Some(&self.tiles[y * self.width + x])
-        } else {
-            None
-        }
-    }
-
     pub fn set(&mut self, x: usize, y: usize, tile: TileType) {
         if x < self.width && y < self.height {
             self.tiles[y * self.width + x] = tile;
         }
+    }
+}
+
+/// Baked terrain data — populated once at startup from element_config,
+/// never reads the config tables afterwards.
+#[derive(Resource)]
+pub struct TerrainData {
+    pub names: [&'static str; 15],
+    pub interactions: [Interaction; 15],
+    /// Pre-computed RGBA bytes (sRGB) for each TileType.
+    pub rgbs: [[u8; 4]; 15],
+}
+
+impl TerrainData {
+    pub fn bake() -> Self {
+        let mut names = [""; 15];
+        let mut interactions = [Interaction::None; 15];
+        let mut rgbs = [[0u8; 4]; 15];
+        for cfg in TERRAIN_CONFIGS {
+            let i = cfg.tile_type as u8 as usize;
+            names[i] = cfg.name_en;
+            interactions[i] = cfg.interaction;
+            let srgb = cfg.color.to_srgba();
+            rgbs[i] = [
+                (srgb.red * 255.0) as u8,
+                (srgb.green * 255.0) as u8,
+                (srgb.blue * 255.0) as u8,
+                (srgb.alpha * 255.0) as u8,
+            ];
+        }
+        Self { names, interactions, rgbs }
     }
 }
 
@@ -146,6 +116,77 @@ impl Default for SelectedTile {
     }
 }
 
+/// Tracks which grid cells are occupied by multi-tile entities (buildings).
+/// Inserted during spawn_map, read by building spawn + UI.
+#[derive(Resource)]
+pub struct OccupancyGrid {
+    pub cells: Vec<Option<Entity>>,
+    width: usize,
+    height: usize,
+}
+
+impl OccupancyGrid {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            cells: vec![None; width * height],
+            width,
+            height,
+        }
+    }
+
+    /// Check whether the rectangle [x, x+w) × [y, y+h) is entirely free.
+    pub fn is_free(&self, x: usize, y: usize, w: usize, h: usize) -> bool {
+        if x + w > self.width || y + h > self.height {
+            return false;
+        }
+        for dy in 0..h {
+            for dx in 0..w {
+                if self.cells[(y + dy) * self.width + (x + dx)].is_some() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Mark the rectangle as occupied by `entity`.
+    pub fn occupy(&mut self, x: usize, y: usize, w: usize, h: usize, entity: Entity) {
+        for dy in 0..h {
+            for dx in 0..w {
+                self.cells[(y + dy) * self.width + (x + dx)] = Some(entity);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TileContent spatial index – O(1) UI lookups, built during PostStartup spawn
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TileCategory {
+    Resource,
+    Vegetation,
+    Feature,
+    Building,
+    Cave,
+}
+
+#[derive(Clone)]
+pub struct TileEntry {
+    pub name: &'static str,
+    pub category: TileCategory,
+    pub amount: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Maps tile index → overlays on that tile.
+#[derive(Resource, Default)]
+pub struct TileContent {
+    pub data: HashMap<usize, Vec<TileEntry>>,
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -156,6 +197,7 @@ impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Map>();
         app.init_resource::<SelectedTile>();
+        app.init_resource::<TileContent>();
         app.add_systems(Startup, spawn_map);
         app.add_systems(Update, tile_edit_input);
     }
@@ -176,22 +218,34 @@ fn spawn_map(
         map.tiles = vec![TileType::Grass; MAP_WIDTH * MAP_HEIGHT];
     }
 
-    // Build procedural texture from tile data.
+    // Bake terrain data from config into a persistent Resource.
+    // After this, all runtime code reads from TerrainData, never from config.
+    let td = TerrainData::bake();
+
+    // Build procedural texture from tile data using the baked RGBA values.
     // Texture row 0 = top of image = top of sprite = highest world Y.
     // World tile (x, y=0) is at the bottom → texture row MAP_HEIGHT-1.
     let mut pixel_data = vec![0u8; MAP_WIDTH * MAP_HEIGHT * 4];
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
             let idx = y * MAP_WIDTH + x;
-            let rgba = map.tiles[idx].rgba_bytes();
+            let tile = map.tiles[idx];
+            let rgba = td.rgbs[tile as u8 as usize];
             let data_y = MAP_HEIGHT - 1 - y; // flip Y
             let pi = (data_y * MAP_WIDTH + x) * 4;
-            pixel_data[pi] = rgba[0];
+            pixel_data[pi + 0] = rgba[0];
             pixel_data[pi + 1] = rgba[1];
             pixel_data[pi + 2] = rgba[2];
             pixel_data[pi + 3] = rgba[3];
         }
     }
+
+    // Persist baked data for runtime systems (UI, editing).
+    commands.insert_resource(td);
+
+    // Initialise occupancy grid (buildings will occupy cells in PostStartup).
+    let occ = OccupancyGrid::new(MAP_WIDTH, MAP_HEIGHT);
+    commands.insert_resource(occ);
 
     let mut image = Image::new(
         Extent3d {
@@ -250,6 +304,7 @@ fn tile_edit_input(
     mut map: ResMut<Map>,
     map_image: Res<MapTileImage>,
     mut images: ResMut<Assets<Image>>,
+    terrain_data: Res<TerrainData>,
 ) {
     // --- switch selected terrain type via number keys ---
     if keys.just_pressed(KeyCode::Digit1) {
@@ -298,8 +353,8 @@ fn tile_edit_input(
         selected.0 = TileType::Clay;
     }
 
-    // --- place tile on left click ---
-    if !mouse.just_pressed(MouseButton::Left) {
+    // --- place tile on right click ---
+    if !mouse.just_pressed(MouseButton::Right) {
         return;
     }
 
@@ -333,7 +388,7 @@ fn tile_edit_input(
 
     // Update the terrain texture pixel(s).
     if let Some(image) = images.get_mut(&map_image.0) {
-        let rgba = new_type.rgba_bytes();
+        let rgba = terrain_data.rgbs[new_type as u8 as usize];
         let data_y = MAP_HEIGHT - 1 - ty; // flip Y
         let pi = (data_y * MAP_WIDTH + tx) * 4;
         image.data[pi] = rgba[0];

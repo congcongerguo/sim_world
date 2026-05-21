@@ -6,8 +6,8 @@ use bevy::prelude::*;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum Lang {
-    #[default]
     En,
+    #[default]
     Zh,
 }
 
@@ -76,6 +76,12 @@ static ZH: &[(&str, &str)] = &[
     ("Flower", "花"),
     ("Dead Bush", "枯草"),
     ("Cactus", "仙人掌"),
+    // Building names
+    ("House", "房屋"),
+    ("Stone House", "石屋"),
+    ("Watchtower", "瞭望塔"),
+    ("Workshop", "工坊"),
+    ("Well", "水井"),
     // UI strings
     ("Hover over the map", "悬停在地图上查看信息"),
     ("Tile", "坐标"),
@@ -86,10 +92,33 @@ static ZH: &[(&str, &str)] = &[
     ("landmark", "地标"),
     ("resource", "资源"),
     ("vegetation", "植被"),
+    ("building", "建筑"),
     ("underground", "地下"),
     ("Cloud", "云"),
     ("Bird", "鸟"),
     ("Cave", "洞穴"),
+    ("Player", "角色"),
+    ("Character", "角色"),
+    ("character", "角色"),
+    ("Time", "时间"),
+    ("PAUSED", "已暂停"),
+    ("Farmland", "农田"),
+    ("Fallow", "空闲"),
+    ("Growing", "生长中"),
+    ("Weedy", "杂草"),
+    ("Ready", "可收获"),
+    ("Clearing", "开垦中"),
+    ("Storage", "储量"),
+    ("farm", "农田"),
+    ("Action", "操作"),
+    ("Press C to interact", "按 C 键操作"),
+    ("Adult", "成人"),
+    ("Child", "小孩"),
+    ("Adults", "成人"),
+    ("Children", "小孩"),
+    ("Tombstone", "墓碑"),
+    ("Cause", "死因"),
+    ("Old Age", "寿终"),
 ];
 
 // ---------------------------------------------------------------------------
