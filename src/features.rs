@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
+use crate::assets::GameAssets;
 use crate::element_config::{Interaction, FEATURE_CONFIGS};
 use crate::map::{Map, TileCategory, TileContent, TileEntry, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_rng::SimRng;
@@ -50,11 +51,24 @@ impl Plugin for FeaturePlugin {
 // System
 // ---------------------------------------------------------------------------
 
+fn feature_texture<'a>(kind: FeatureKind, assets: &'a GameAssets) -> &'a Handle<Image> {
+    match kind {
+        FeatureKind::RockFormation => &assets.feat_rock_formation,
+        FeatureKind::Ruins => &assets.feat_ruins,
+        FeatureKind::AncientTree => &assets.feat_ancient_tree,
+        FeatureKind::HotSpring => &assets.feat_hot_spring,
+        FeatureKind::Geyser => &assets.feat_geyser,
+        FeatureKind::MeteorCrater => &assets.feat_meteor_crater,
+        FeatureKind::Fossil => &assets.feat_fossil,
+    }
+}
+
 fn spawn_features(
     mut commands: Commands,
     map: Res<Map>,
     mut rng: ResMut<SimRng>,
     mut tile_content: ResMut<TileContent>,
+    assets: Res<GameAssets>,
 ) {
     for cfg in FEATURE_CONFIGS {
         for y in 0..MAP_HEIGHT {
@@ -70,6 +84,7 @@ fn spawn_features(
                 let world_x = x as f32 * TILE_SIZE + TILE_SIZE / 2.0;
                 let world_y = y as f32 * TILE_SIZE + TILE_SIZE / 2.0;
 
+                let tex = feature_texture(cfg.kind, &assets).clone();
                 commands.spawn((
                     Feature {
                         kind: cfg.kind,
@@ -77,7 +92,7 @@ fn spawn_features(
                         interaction: cfg.interaction,
                     },
                     Sprite {
-                        color: cfg.color,
+                        image: tex,
                         custom_size: Some(Vec2::new(cfg.size, cfg.size)),
                         anchor: Anchor::Center,
                         ..default()

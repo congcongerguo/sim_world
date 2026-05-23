@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
-use crate::farmland::{color_for_state, CropState, FarmTile};
+use crate::assets::GameAssets;
+use crate::farmland::{farm_texture, CropState, FarmTile};
 use crate::player::House;
 
 // Shop constants (mirrored from player.rs for action handling)
@@ -47,11 +48,12 @@ fn process_action_events(
     mut events: EventReader<ActionEvent>,
     mut farm_tiles: Query<(&mut FarmTile, &mut Sprite)>,
     mut houses: Query<&mut House>,
+    assets: Res<GameAssets>,
 ) {
     for event in events.read() {
         match event {
             ActionEvent::FarmInteract { plot_id, house_id } => {
-                apply_farm_interact(*plot_id, *house_id, &mut farm_tiles, &mut houses);
+                apply_farm_interact(*plot_id, *house_id, &mut farm_tiles, &mut houses, &assets);
             }
             ActionEvent::ShopTrade { house_id } => {
                 apply_shop_trade(*house_id, &mut houses);
@@ -65,6 +67,7 @@ fn apply_farm_interact(
     house_id: Option<usize>,
     farm_tiles: &mut Query<(&mut FarmTile, &mut Sprite)>,
     houses: &mut Query<&mut House>,
+    assets: &GameAssets,
 ) {
     // Read current state of the plot
     let mut current = None;
@@ -93,14 +96,16 @@ fn apply_farm_interact(
         _ => "TOGGLE",
     };
 
-    // Apply state + colour to every tile in the plot
+    // Apply state to every tile in the plot + swap texture
+    let new_tex = farm_texture(st, assets).clone();
     for (mut ft, mut sprite) in farm_tiles.iter_mut() {
         if ft.plot != plot_id {
             continue;
         }
         ft.state = st;
         ft.growth = 0.0;
-        sprite.color = color_for_state(st);
+        sprite.color = Color::WHITE;
+        sprite.image = new_tex.clone();
     }
 
     info!(
@@ -118,7 +123,7 @@ fn apply_farm_interact(
 
             for mut house in houses.iter_mut() {
                 if house.id == hid {
-                    house.storage += tile_count;
+                    house.storage += tile_count * 2;
                     info!(
                         "[FARM] Plot #{} HARVEST → House #{} +{} food (storage: {})",
                         plot_id, hid, tile_count, house.storage,

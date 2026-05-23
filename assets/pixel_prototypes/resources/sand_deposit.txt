@@ -1,0 +1,15 @@
+sand_deposit - 沙矿
+
+类别: 资源 - 可采集的矿物资源点
+生成引擎: ComfyUI SDXL
+种子: 227
+像素尺寸: 32x32 (预览: 128x128)
+原始尺寸: 512x512
+
+描述: 游戏的沙矿像素艺术原型。
+使用SDXL生成后降采样为32x32像素块风格。
+
+使用方式:
+- 直接使用: assets/pixel_prototypes/resources/sand_deposit.png (32x32)
+- 导入游戏: 作为TextureAtlas瓦片或独立Sprite加载
+- 建议缩放: 游戏中以TILE_SIZE(32px)显示

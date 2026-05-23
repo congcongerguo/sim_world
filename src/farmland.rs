@@ -1,19 +1,21 @@
 use bevy::prelude::*;
 
 use crate::actions::ActionEvent;
+use crate::assets::GameAssets;
 use crate::map::{Map, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
-use crate::sim_time::TimeScale;
+use crate::sim_time::{TimeScale, MONTH};
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants — expressed in game days (1 tick ≈ 1 day, 1 month = 30 days)
 // ---------------------------------------------------------------------------
 
-const GROW_TIME: f64 = 30.0;
+/// Crop growth time (~1 month).
+const GROW_TIME: f64 = 1.0 * MONTH;
 const WEED_CHANCE: f64 = 0.35;
-/// Sim-seconds to clear one tile of wild vegetation.
+/// Days to clear one tile of wild vegetation (15 days).
 pub const CLEAR_TIME: f64 = 15.0;
 /// Number of tiles automatically spawned per plot at game start.
-const STARTER_TILES: usize = 2;
+const STARTER_TILES: usize = 12;
 /// Target number of tiles per plot (organic shape, not a fixed rectangle).
 const TARGET_PLOT_SIZE: usize = 15;
 
@@ -47,11 +49,11 @@ pub struct FarmTile {
 #[derive(Resource)]
 pub struct FarmLayout {
     /// Each plot's tile positions (irregular organic shape).
-    pub plots: [Vec<(usize, usize)>; 3],
+    pub plots: Vec<Vec<(usize, usize)>>,
     /// Top-left tile of each 2×2 house.
-    pub houses: [(usize, usize); 3],
+    pub houses: Vec<(usize, usize)>,
     /// Spawn tile for each character.
-    pub chars: [(usize, usize); 3],
+    pub chars: Vec<(usize, usize)>,
 }
 
 /// Tiles that have been reserved for a plot but not yet cleared by a character.
@@ -102,7 +104,7 @@ pub fn color_for_clearing(progress: f64) -> Color {
 // Position finding – flood-fill irregular organic plots on grass / meadow
 // ---------------------------------------------------------------------------
 
-fn find_plot_positions(map: &Map) -> [Vec<(usize, usize)>; 3] {
+fn find_plot_positions(map: &Map, count: usize) -> Vec<Vec<(usize, usize)>> {
     let arable = [TileType::Grass, TileType::Meadow];
     let cx = MAP_WIDTH as f64 / 2.0;
     let cy = MAP_HEIGHT as f64 / 2.0;
@@ -120,9 +122,9 @@ fn find_plot_positions(map: &Map) -> [Vec<(usize, usize)>; 3] {
     candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
     let mut used = vec![false; MAP_WIDTH * MAP_HEIGHT];
-    let mut plots: [Vec<(usize, usize)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut plots = vec![Vec::new(); count];
 
-    for pi in 0..3 {
+    for pi in 0..count {
         let seed_pos = candidates.iter().position(|(x, y, _)| {
             if used[*y * MAP_WIDTH + *x] {
                 return false;
@@ -180,16 +182,17 @@ fn find_plot_positions(map: &Map) -> [Vec<(usize, usize)>; 3] {
 // ---------------------------------------------------------------------------
 
 pub fn setup_farm_layout(map: Res<Map>, mut commands: Commands) {
-    let plots = find_plot_positions(&map);
-    let mut houses = [(0usize, 0usize); 3];
-    let mut chars = [(0usize, 0usize); 3];
+    const INITIAL_COUNT: usize = 3;
+    let mut plots = find_plot_positions(&map, INITIAL_COUNT);
+    let mut houses = Vec::with_capacity(INITIAL_COUNT);
+    let mut chars = Vec::with_capacity(INITIAL_COUNT);
 
-    for i in 0..3 {
+    for i in 0..INITIAL_COUNT {
         let tiles = &plots[i];
         if tiles.is_empty() {
             // Fallback: safe open area
-            houses[i] = (37, 42 + i * 4);
-            chars[i] = (39, 43 + i * 4);
+            houses.push((37, 42 + i * 4));
+            chars.push((39, 43 + i * 4));
             continue;
         }
 
@@ -203,8 +206,31 @@ pub fn setup_farm_layout(map: Res<Map>, mut commands: Commands) {
         let max_y = *col_ys.iter().max().unwrap_or(&0);
         let center_y = (min_y + max_y) / 2;
 
-        houses[i] = (rightmost + 1, center_y.saturating_sub(1));
-        chars[i] = (houses[i].0 + 2, houses[i].1 + 1);
+        let h = (rightmost + 1, center_y.saturating_sub(1));
+        let c = (h.0 + 2, h.1 + 1);
+        houses.push(h);
+        chars.push(c);
+    }
+
+    // --- 为商店预留空间 ---
+    // 商店在 spawn_shop 中放置在 houses[0] + (4, 5)，占地 2x2
+    // 清除商店区域及周围 2 格缓冲内的农田，确保角色能走到商店
+    if !houses.is_empty() {
+        let (hx, hy) = houses[0];
+        let shop_x = hx + 4;
+        let shop_y = hy + 5;
+
+        // 需要清除的区域: shop的 2x2 范围 + 周围 2 格缓冲
+        let min_cx = (shop_x as isize - 2).max(0) as usize;
+        let min_cy = (shop_y as isize - 2).max(0) as usize;
+        let max_cx = (shop_x as isize + 3).min(MAP_WIDTH as isize - 1) as usize;
+        let max_cy = (shop_y as isize + 3).min(MAP_HEIGHT as isize - 1) as usize;
+
+        for plot in plots.iter_mut() {
+            plot.retain(|(px, py)| {
+                !(*px >= min_cx && *px <= max_cx && *py >= min_cy && *py <= max_cy)
+            });
+        }
     }
 
     commands.insert_resource(FarmLayout {
@@ -214,7 +240,18 @@ pub fn setup_farm_layout(map: Res<Map>, mut commands: Commands) {
     });
 }
 
-fn spawn_farmland(mut commands: Commands, layout: Res<FarmLayout>) {
+pub fn farm_texture<'a>(state: CropState, assets: &'a GameAssets) -> &'a Handle<Image> {
+    match state {
+        CropState::Fallow => &assets.misc_farm_fallow,
+        CropState::Growing => &assets.misc_farm_growing,
+        CropState::Weedy => &assets.misc_farm_weedy,
+        CropState::Ready => &assets.misc_farm_ready,
+        // Clearing uses the fallow (dirt) texture as base
+        CropState::Clearing => &assets.misc_farm_fallow,
+    }
+}
+
+fn spawn_farmland(mut commands: Commands, layout: Res<FarmLayout>, assets: Res<GameAssets>) {
     let mut pending = PendingFarmland::default();
 
     for (plot_idx, tiles) in layout.plots.iter().enumerate() {
@@ -233,7 +270,7 @@ fn spawn_farmland(mut commands: Commands, layout: Res<FarmLayout>) {
                         growth: 0.0,
                     },
                     Sprite {
-                        color: color_for_state(CropState::Fallow),
+                        image: assets.misc_farm_fallow.clone(),
                         custom_size: Some(Vec2::new(TILE_SIZE - 2.0, TILE_SIZE - 2.0)),
                         ..default()
                     },
@@ -305,19 +342,19 @@ fn update_crop_growth(
             if tile.growth >= CLEAR_TIME {
                 tile.state = CropState::Fallow;
                 tile.growth = 0.0;
-                sprite.color = color_for_state(CropState::Fallow);
+                sprite.color = Color::WHITE;
             }
             continue;
         }
 
-        // Handle growing tiles (existing logic)
+        // Handle growing tiles
         if let Some((growth, new_state)) = updates.get(&tile.plot) {
             if tile.state == CropState::Growing {
                 tile.growth = *growth;
                 if let Some(state) = new_state {
                     tile.state = *state;
                     tile.growth = 0.0;
-                    sprite.color = color_for_state(*state);
+                    sprite.color = Color::WHITE;
                 }
             }
         }

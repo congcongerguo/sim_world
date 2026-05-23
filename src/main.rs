@@ -1,4 +1,5 @@
 mod actions;
+mod assets;
 mod birds;
 mod buildings;
 mod camera;
@@ -35,6 +36,7 @@ fn main() {
         .add_plugins(generation::GenerationPlugin)
         .add_plugins(lang::LangPlugin)
         .add_plugins(sim_time::SimTimePlugin)
+        .add_plugins(assets::AssetPlugin)
         .add_plugins(map::MapPlugin)
         .add_plugins(camera::CameraPlugin)
         .add_plugins(farmland::FarmlandPlugin)

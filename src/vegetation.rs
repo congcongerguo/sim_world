@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
+use crate::assets::GameAssets;
 use crate::element_config::{Interaction, VEGETATION_CONFIGS, VEG_SPAWN_RULES};
 use crate::map::{Map, TileCategory, TileContent, TileEntry, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_rng::SimRng;
@@ -50,11 +51,25 @@ impl Plugin for VegetationPlugin {
 // System
 // ---------------------------------------------------------------------------
 
+/// Map vegetation kinds to texture handles.
+fn veg_texture<'a>(kind: VegetationKind, assets: &'a GameAssets) -> &'a Handle<Image> {
+    match kind {
+        VegetationKind::DeciduousTree => &assets.veg_deciduous_tree,
+        VegetationKind::PineTree => &assets.veg_pine_tree,
+        VegetationKind::PalmTree => &assets.veg_palm_tree,
+        VegetationKind::Bush => &assets.veg_bush,
+        VegetationKind::Flower => &assets.veg_flower,
+        VegetationKind::DeadBush => &assets.veg_dead_bush,
+        VegetationKind::Cactus => &assets.veg_cactus,
+    }
+}
+
 fn spawn_vegetation(
     mut commands: Commands,
     map: Res<Map>,
     mut rng: ResMut<SimRng>,
     mut tile_content: ResMut<TileContent>,
+    assets: Res<GameAssets>,
 ) {
     for rule in VEG_SPAWN_RULES {
         for y in 0..MAP_HEIGHT {
@@ -75,6 +90,7 @@ fn spawn_vegetation(
                 let world_x = x as f32 * TILE_SIZE + TILE_SIZE / 2.0 + ox as f32;
                 let world_y = y as f32 * TILE_SIZE + TILE_SIZE / 2.0 + oy as f32;
 
+                let tex = veg_texture(rule.kind, &assets).clone();
                 commands.spawn((
                     Vegetation {
                         kind: rule.kind,
@@ -82,7 +98,7 @@ fn spawn_vegetation(
                         interaction: cfg.interaction,
                     },
                     Sprite {
-                        color: cfg.color,
+                        image: tex,
                         custom_size: Some(Vec2::new(cfg.size, cfg.size)),
                         anchor: Anchor::Center,
                         ..default()

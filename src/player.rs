@@ -1,25 +1,31 @@
 use bevy::prelude::*;
 
 use crate::actions::ActionEvent;
-use crate::farmland::{color_for_clearing, color_for_state, setup_farm_layout, CropState, FarmLayout, FarmTile, PendingFarmland};
-use crate::map::{Map, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
-use crate::sim_time::TimeScale;
+use crate::assets::GameAssets;
+use crate::farmland::{color_for_clearing, setup_farm_layout, CropState, FarmLayout, FarmTile, PendingFarmland};
+use crate::map::{Map, TileCategory, TileContent, TileEntry, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
+use crate::sim_time::{TimeScale, MONTH, YEAR};
 use crate::vegetation::{Vegetation, VegetationKind};
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants — expressed in game days (1 tick ≈ 1 day)
+// 1 month = 30 days, 1 year = 360 days
 // ---------------------------------------------------------------------------
 
-/// Sim-seconds per "day" for food consumption.
-const DAY_SECONDS: f64 = 12.0;
-/// Minimum sim-seconds between birth attempts.
+/// Days between adult meals.
+const MEAL_INTERVAL: f64 = 12.0;
+/// Minimum days between birth attempts (~1.3 months).
 const CHILD_BIRTH_INTERVAL: f64 = 40.0;
-/// Sim-seconds for a child to grow into an adult.
-const CHILD_GROWTH_DURATION: f64 = 60.0;
+/// Days for a child to grow into an adult (2 months).
+const CHILD_GROWTH_DURATION: f64 = 2.0 * MONTH;
 /// Max children per household.
 const MAX_CHILDREN: usize = 3;
-/// Sim-seconds after which an adult dies of old age.
-const LIFESPAN: f64 = 350.0;
+/// Max age for reproduction (~6.7 months).
+const MAX_REPRODUCTION_AGE: f64 = 200.0;
+/// Lifespan (~1 year).
+const LIFESPAN: f64 = 1.0 * YEAR;
+/// Days a house can have 0 food before an adult starves (2 months).
+const STARVATION_THRESHOLD: f64 = 2.0 * MONTH;
 
 /// Graveyard top-left tile on the map.
 const GRAVEYARD_X: usize = 3;
@@ -29,7 +35,7 @@ const GRAVEYARD_W: usize = 10;
 const GRAVEYARD_H: usize = 15;
 
 // Essentials & shop
-/// Sim-seconds between essentials consumption ticks.
+/// Days between essentials consumption ticks (~1.7 months).
 const ESSENTIALS_DEPLETION_INTERVAL: f64 = 50.0;
 /// Food cost per shop visit.
 const SHOP_COST_FOOD: u32 = 3;
@@ -40,8 +46,8 @@ const HOUSE_START_ESSENTIALS: u32 = 20;
 const ESSENTIALS_LOW_THRESHOLD: u32 = 5;
 
 // Road wear
-const ROAD_THRESHOLD_1: u32 = 15;
-const ROAD_THRESHOLD_3: u32 = 150;
+const ROAD_THRESHOLD_1: u32 = 4;
+const ROAD_THRESHOLD_3: u32 = 40;
 
 // ---------------------------------------------------------------------------
 // Components
@@ -50,15 +56,51 @@ const ROAD_THRESHOLD_3: u32 = 150;
 #[derive(Clone, Copy, PartialEq)]
 enum AiState {
     Idle,
-    MoveTo(f32, f32),
+    MoveTo(f32, f32, bool), // x, y, purposeful (creates road wear)
     Exploring { origin_x: f32, origin_y: f32, dir_x: f32, dir_y: f32 },
     GoingToShop,
+    GoingToSocial(f32, f32),
+    Socializing,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Gender {
+    Male,
+    Female,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Personality {
+    pub openness: f32,
+    pub conscientiousness: f32,
+    pub extraversion: f32,
+    pub agreeableness: f32,
+    pub neuroticism: f32,
+}
+
+impl Personality {
+    pub fn random() -> Self {
+        Self {
+            openness: rand::random::<f32>(),
+            conscientiousness: rand::random::<f32>(),
+            extraversion: rand::random::<f32>(),
+            agreeableness: rand::random::<f32>(),
+            neuroticism: rand::random::<f32>(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LifeStage {
     Child,
     Adult,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MaritalStatus {
+    Single,
+    Married,
+    Widowed,
 }
 
 /// An autonomous character in the simulation.
@@ -69,13 +111,16 @@ pub struct Character {
     timer: f64,
     /// Flag raised when the character arrives at a farm tile.
     action_tile: Option<(usize, usize)>,
-    /// Which plot (0..2) this character manages.
+    /// Which plot (settlement) this character manages.
     pub plot_id: usize,
     /// Which house (by House::id) this character lives in.
     pub house_id: usize,
     pub stage: LifeStage,
     /// Accumulated sim-seconds since birth.
     pub age: f64,
+    pub gender: Gender,
+    pub personality: Personality,
+    pub marital: MaritalStatus,
 }
 
 /// Tracks age of a child character (sim-seconds accumulated).
@@ -93,6 +138,7 @@ pub struct Grave;
 pub struct GraveInfo {
     pub age: f64,
     pub house_id: usize,
+    pub gender: Gender,
     pub cause: &'static str,
 }
 
@@ -120,12 +166,17 @@ impl Plugin for CharacterPlugin {
         app.init_resource::<RoadWear>();
         app.init_resource::<RoadRender>();
         app.init_resource::<EssentialsTimer>();
+        app.init_resource::<RomanceTimer>();
+        app.init_resource::<NextGraveSlot>();
+        app.init_resource::<PathMemory>();
+        app.init_resource::<StarvationTimer>();
         app.add_systems(PostStartup, (
             spawn_characters.after(setup_farm_layout),
             spawn_houses.after(setup_farm_layout),
             spawn_shop.after(setup_farm_layout),
         ));
         app.add_systems(Update, (
+            romance_system,
             character_ai,
             process_actions,
             reproduction_system,
@@ -197,107 +248,53 @@ fn find_farm_tile<'a>(
 // Spawn helpers
 // ---------------------------------------------------------------------------
 
-fn spawn_character_sprite(parent: &mut ChildBuilder, body_color: Color) {
+fn spawn_character_sprite(parent: &mut ChildBuilder, texture: Handle<Image>) {
     parent.spawn((
         Sprite {
-            color: body_color,
-            custom_size: Some(Vec2::new(14.0, 20.0)),
+            image: texture,
+            custom_size: Some(Vec2::new(TILE_SIZE, TILE_SIZE)),
             ..default()
         },
-        Transform::from_xyz(0.0, -4.0, 0.0),
-        GlobalTransform::default(),
-        Visibility::default(),
-    ));
-    parent.spawn((
-        Sprite {
-            color: Color::srgb(1.0, 0.85, 0.65),
-            custom_size: Some(Vec2::new(12.0, 12.0)),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 12.0, 0.0),
+        Transform::from_xyz(0.0, 0.0, 0.0),
         GlobalTransform::default(),
         Visibility::default(),
     ));
 }
 
-fn spawn_child_sprite(parent: &mut ChildBuilder, body_color: Color) {
+fn spawn_child_sprite(parent: &mut ChildBuilder, texture: Handle<Image>) {
     parent.spawn((
         Sprite {
-            color: body_color,
-            custom_size: Some(Vec2::new(10.0, 14.0)),
+            image: texture,
+            custom_size: Some(Vec2::new(28.0, 28.0)),
             ..default()
         },
-        Transform::from_xyz(0.0, -2.0, 0.0),
-        GlobalTransform::default(),
-        Visibility::default(),
-    ));
-    parent.spawn((
-        Sprite {
-            color: Color::srgb(1.0, 0.85, 0.65),
-            custom_size: Some(Vec2::new(8.0, 8.0)),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 10.0, 0.0),
+        Transform::from_xyz(0.0, 0.0, 0.0),
         GlobalTransform::default(),
         Visibility::default(),
     ));
 }
 
-fn spawn_house_building(parent: &mut ChildBuilder) {
-    // Ground shadow (at bottom: negative Y)
+fn spawn_house_building(parent: &mut ChildBuilder, texture: Handle<Image>) {
     parent.spawn((
         Sprite {
-            color: Color::srgb(0.30, 0.18, 0.08),
-            custom_size: Some(Vec2::new(48.0, 8.0)),
+            image: texture,
+            custom_size: Some(Vec2::new(TILE_SIZE * 2.0, TILE_SIZE * 2.0)),
             ..default()
         },
-        Transform::from_xyz(0.0, -18.0, 0.01),
+        Transform::from_xyz(0.0, 0.0, 0.01),
         GlobalTransform::default(),
         Visibility::default(),
     ));
-    // Left slope (人字形 left side — peak at top-right, base at bottom-left)
+}
+
+fn spawn_shop_building(parent: &mut ChildBuilder, texture: Handle<Image>) {
     parent.spawn((
         Sprite {
-            color: Color::srgb(0.55, 0.35, 0.15),
-            custom_size: Some(Vec2::new(42.0, 8.0)),
+            image: texture,
+            custom_size: Some(Vec2::new(TILE_SIZE * 2.0, TILE_SIZE * 2.0)),
             ..default()
         },
-        Transform::from_xyz(-12.0, 0.0, 0.02)
-            .with_rotation(Quat::from_rotation_z(0.98)),
-        GlobalTransform::default(),
-        Visibility::default(),
-    ));
-    // Right slope (人字形 right side — peak at top-left, base at bottom-right)
-    parent.spawn((
-        Sprite {
-            color: Color::srgb(0.55, 0.35, 0.15),
-            custom_size: Some(Vec2::new(42.0, 8.0)),
-            ..default()
-        },
-        Transform::from_xyz(12.0, 0.0, 0.02)
-            .with_rotation(Quat::from_rotation_z(-0.98)),
-        GlobalTransform::default(),
-        Visibility::default(),
-    ));
-    // Ridge cap (at peak: positive Y)
-    parent.spawn((
-        Sprite {
-            color: Color::srgb(0.40, 0.22, 0.06),
-            custom_size: Some(Vec2::new(5.0, 3.0)),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 17.0, 0.03),
-        GlobalTransform::default(),
-        Visibility::default(),
-    ));
-    // Dark opening (at bottom: negative Y)
-    parent.spawn((
-        Sprite {
-            color: Color::srgb(0.08, 0.05, 0.02),
-            custom_size: Some(Vec2::new(10.0, 14.0)),
-            ..default()
-        },
-        Transform::from_xyz(0.0, -17.0, 0.03),
+        Transform::from_xyz(0.0, 0.0, 0.01),
         GlobalTransform::default(),
         Visibility::default(),
     ));
@@ -307,17 +304,9 @@ fn spawn_house_building(parent: &mut ChildBuilder) {
 // Spawn
 // ---------------------------------------------------------------------------
 
-const CHAR_COLORS: &[(f32, f32, f32)] = &[
-    (0.15, 0.55, 0.95), // blue
-    (0.55, 0.20, 0.75), // purple
-    (0.20, 0.70, 0.40), // green
-];
-
-fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>) {
-    for i in 0..3 {
+fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>, assets: Res<GameAssets>) {
+    for i in 0..layout.chars.len() {
         let (tx, ty) = layout.chars[i];
-        let (r, g, b) = CHAR_COLORS[i];
-        let color = Color::srgb(r, g, b);
 
         // Spawn 2 adults per house (husband & wife)
         for offset_x in [0i8, 1] {
@@ -325,23 +314,32 @@ fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>) {
                 (tx as i8 + offset_x) as usize,
                 ty,
             );
+            let gender = if offset_x == 0 { Gender::Male } else { Gender::Female };
+            let tex = if offset_x == 0 {
+                assets.char_male.clone()
+            } else {
+                assets.char_female.clone()
+            };
             commands.spawn((
                 Character {
                     speed: 100.0,
                     state: AiState::Idle,
-                    timer: offset_x as f64, // stagger their initial timers
+                    timer: offset_x as f64,
                     action_tile: None,
                     plot_id: i,
                     house_id: i,
                     stage: LifeStage::Adult,
                     age: rand::random::<f64>() * 100.0 + 50.0,
+                    gender,
+                    personality: Personality::random(),
+                    marital: MaritalStatus::Married,
                 },
                 Transform::from_xyz(x, y, 2.0),
                 GlobalTransform::default(),
                 Visibility::default(),
             ))
             .with_children(|parent| {
-                spawn_character_sprite(parent, color);
+                spawn_character_sprite(parent, tex);
             });
         }
     }
@@ -359,8 +357,13 @@ pub struct House {
     pub essentials: u32,
 }
 
-fn spawn_houses(mut commands: Commands, layout: Res<FarmLayout>) {
-    for i in 0..3 {
+fn spawn_houses(
+    mut commands: Commands,
+    layout: Res<FarmLayout>,
+    assets: Res<GameAssets>,
+    mut tile_content: ResMut<TileContent>,
+) {
+    for i in 0..layout.houses.len() {
         let (tile_x, tile_y) = layout.houses[i];
         let w = 2usize;
         let h = 2usize;
@@ -375,28 +378,42 @@ fn spawn_houses(mut commands: Commands, layout: Res<FarmLayout>) {
                 tile_y,
                 w,
                 h,
-                storage: 10,
+                storage: 20,
                 essentials: HOUSE_START_ESSENTIALS,
-            },
-            Sprite {
-                color: Color::srgb(0.45, 0.28, 0.12),
-                custom_size: Some(Vec2::new(40.0, 36.0)),
-                ..default()
             },
             Transform::from_xyz(world_x, world_y, 1.3),
             GlobalTransform::default(),
             Visibility::default(),
         ))
         .with_children(|parent| {
-            spawn_house_building(parent);
+            spawn_house_building(parent, assets.bld_house.clone());
         });
+
+        // Register in TileContent for UI
+        for dy in 0..h {
+            for dx in 0..w {
+                let idx = (tile_y + dy) * MAP_WIDTH + (tile_x + dx);
+                tile_content.data.entry(idx).or_default().push(TileEntry {
+                    name: "House",
+                    category: TileCategory::Building,
+                    amount: 0,
+                    w: w as u32,
+                    h: h as u32,
+                });
+            }
+        }
     }
 }
 
 /// Spawn the village shop near the first settlement.
-fn spawn_shop(mut commands: Commands, layout: Res<FarmLayout>) {
-    // Place shop a few tiles from house #1 (middle of the initial 3)
-    let (hx, hy) = layout.houses[1];
+fn spawn_shop(
+    mut commands: Commands,
+    layout: Res<FarmLayout>,
+    assets: Res<GameAssets>,
+    mut tile_content: ResMut<TileContent>,
+) {
+    // Place shop a few tiles from the first house
+    let (hx, hy) = layout.houses[0];
     let shop_tile_x = hx + 4;
     let shop_tile_y = hy + 5;
 
@@ -410,44 +427,101 @@ fn spawn_shop(mut commands: Commands, layout: Res<FarmLayout>) {
 
     commands.spawn((
         Shop,
-        Sprite {
-            color: Color::srgb(0.95, 0.88, 0.75),
-            custom_size: Some(Vec2::new(48.0, 48.0)),
-            ..default()
-        },
         Transform::from_xyz(wx, wy, 1.3),
         GlobalTransform::default(),
         Visibility::default(),
     ))
     .with_children(|parent| {
-        // Red roof
-        parent.spawn((
-            Sprite {
-                color: Color::srgb(0.85, 0.12, 0.08),
-                custom_size: Some(Vec2::new(52.0, 12.0)),
-                ..default()
-            },
-            Transform::from_xyz(0.0, -20.0, 0.01),
-            GlobalTransform::default(),
-            Visibility::default(),
-        ));
-        // Yellow sign
-        parent.spawn((
-            Sprite {
-                color: Color::srgb(0.92, 0.90, 0.30),
-                custom_size: Some(Vec2::new(20.0, 8.0)),
-                ..default()
-            },
-            Transform::from_xyz(0.0, 20.0, 0.01),
-            GlobalTransform::default(),
-            Visibility::default(),
-        ));
+        spawn_shop_building(parent, assets.misc_shop.clone());
     });
+
+    // Register in TileContent for UI
+    for dy in 0..2 {
+        for dx in 0..2 {
+            let idx = (shop_tile_y + dy) * MAP_WIDTH + (shop_tile_x + dx);
+            tile_content.data.entry(idx).or_default().push(TileEntry {
+                name: "Shop",
+                category: TileCategory::Building,
+                amount: 0,
+                w: 2,
+                h: 2,
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // AI: movement & decision
 // ---------------------------------------------------------------------------
+
+/// Compute a direction vector biased toward known paths and easier terrain.
+/// Farm tiles are avoided unless the character is heading to one for farm work.
+fn biased_dir(
+    from: (f32, f32),
+    to: (f32, f32),
+    map: &Map,
+    path_memory: &PathMemory,
+    farm_set: &std::collections::HashSet<(usize, usize)>,
+) -> (f32, f32) {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    if dist < 2.0 {
+        return (0.0, 0.0);
+    }
+    let mut dir_x = dx / dist;
+    let mut dir_y = dy / dist;
+
+    let (ctx, cty) = (
+        (from.0 / TILE_SIZE) as isize,
+        (from.1 / TILE_SIZE) as isize,
+    );
+    let mut nudge_x = 0.0f32;
+    let mut nudge_y = 0.0f32;
+
+    for (otx, oty) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let tx = ctx + otx;
+        let ty = cty + oty;
+        if tx < 0 || tx >= MAP_WIDTH as isize || ty < 0 || ty >= MAP_HEIGHT as isize {
+            continue;
+        }
+        let (tux, tuy) = (tx as usize, ty as usize);
+        // Farm tiles are off-limits for non-farm movement
+        if farm_set.contains(&(tux, tuy)) {
+            // Check if the character's destination is a farm tile (allow access)
+            let dest_tx = (to.0 / TILE_SIZE) as usize;
+            let dest_ty = (to.1 / TILE_SIZE) as usize;
+            if !farm_set.contains(&(dest_tx, dest_ty)) {
+                continue; // skip — character is just passing through
+            }
+            // Fall through: character is heading to a farm tile, allow normal scoring
+        }
+        let terrain_speed = match map.tiles[tuy * MAP_WIDTH + tux] {
+            TileType::Grass | TileType::Meadow | TileType::Dirt => 1.0,
+            TileType::Sand | TileType::Clay => 0.85,
+            TileType::Desert => 0.75,
+            TileType::Tundra => 0.6,
+            TileType::Forest | TileType::Snow => 0.5,
+            TileType::Stone => 0.4,
+            TileType::Swamp => 0.3,
+            TileType::Ice => 0.65,
+            _ => 0.0,
+        };
+        let mem = path_memory.counts[tuy * MAP_WIDTH + tux] as f32;
+        let weight = terrain_speed * (1.0 + mem * 0.1);
+        nudge_x += otx as f32 * weight;
+        nudge_y += oty as f32 * weight;
+    }
+
+    dir_x += nudge_x * 0.05;
+    dir_y += nudge_y * 0.05;
+    let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+    if len > 0.01 {
+        (dir_x / len, dir_y / len)
+    } else {
+        (dx / dist, dy / dist)
+    }
+}
 
 fn character_ai(
     time: Res<Time>,
@@ -461,7 +535,10 @@ fn character_ai(
     mut next_id: ResMut<NextSettlementId>,
     shop_location: Res<ShopLocation>,
     mut road_wear: ResMut<RoadWear>,
+    mut path_memory: ResMut<PathMemory>,
     mut pending_farmland: ResMut<PendingFarmland>,
+    assets: Res<GameAssets>,
+    road_render: Res<RoadRender>,
 ) {
     if scale.speed == 0.0 {
         return;
@@ -478,6 +555,14 @@ fn character_ai(
             }
         }
     }
+
+    // Build farm tile position set — non-farm characters avoid walking here
+    let farm_set: std::collections::HashSet<(usize, usize)> = farm_tiles.iter()
+        .map(|(ft, _)| (ft.tile_x, ft.tile_y))
+        .collect();
+
+    // Road mask: tiles with road sprites cannot have houses built on them
+    let road_mask: Vec<bool> = road_render.tiles.iter().map(|e| e.is_some()).collect();
 
     // Existing occupied tiles for overlap checks during building
     let existing: Vec<(usize, usize)> = {
@@ -512,11 +597,11 @@ fn character_ai(
                         if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
                             let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
                             let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
-                            let wx = hx + (rand::random::<f32>() - 0.5) * 80.0;
-                            let wy = hy + (rand::random::<f32>() - 0.5) * 80.0;
-                            ch.state = AiState::MoveTo(wx, wy);
+                            let wx = hx + (rand::random::<f32>() - 0.5) * 200.0;
+                            let wy = hy + (rand::random::<f32>() - 0.5) * 200.0;
+                            ch.state = AiState::MoveTo(wx, wy, false);
                         }
-                        ch.timer = 4.0;
+                        ch.timer = 2.0;
                     } else {
                         // Adult: look for work in assigned plot
                         let farm_list: Vec<(&FarmTile, &Transform)> = farm_tiles
@@ -530,7 +615,7 @@ fn character_ai(
 
                         if let Some((tx, ty)) = target {
                             let (wx, wy) = tile_center(tx, ty);
-                            ch.state = AiState::MoveTo(wx, wy);
+                            ch.state = AiState::MoveTo(wx, wy, true);
                         } else {
                             // Check for pending tiles to clear
                             let pending_target = pending_farmland.plots.get(&ch.plot_id)
@@ -538,7 +623,7 @@ fn character_ai(
 
                             if let Some((px, py)) = pending_target {
                                 let (wx, wy) = tile_center(px, py);
-                                ch.state = AiState::MoveTo(wx, wy);
+                                ch.state = AiState::MoveTo(wx, wy, true);
                             } else {
                                 // No farm work — check essentials first
                                 let needs_essentials = houses.iter()
@@ -550,25 +635,48 @@ fn character_ai(
                                     ch.state = AiState::GoingToShop;
                                     ch.timer = 2.0;
                                 } else {
-                                    // Check if we can explore (enough stored food)
-                                    let can_explore = houses.iter()
-                                        .find(|h| h.id == ch.house_id)
-                                        .map(|h| h.storage >= 25)
-                                        .unwrap_or(false);
-
-                                    if can_explore {
-                                        let angle = rand::random::<f32>() * std::f32::consts::TAU;
-                                        ch.state = AiState::Exploring {
-                                            origin_x: pos.0, origin_y: pos.1,
-                                            dir_x: angle.cos(), dir_y: angle.sin(),
-                                        };
-                                        ch.timer = 2.0;
+                                    // Single adults: go socialize near the shop instead of idling at home
+                                    if ch.marital == MaritalStatus::Single && rand::random::<f32>() < 0.4 {
+                                        let shop_cx = shop_location.tile_x as f32 * TILE_SIZE + TILE_SIZE;
+                                        let shop_cy = shop_location.tile_y as f32 * TILE_SIZE + TILE_SIZE;
+                                        let ox = (rand::random::<f32>() - 0.5) * 64.0;
+                                        let oy = (rand::random::<f32>() - 0.5) * 64.0;
+                                        ch.state = AiState::GoingToSocial(shop_cx + ox, shop_cy + oy);
+                                        ch.timer = 3.0;
                                     } else {
-                                        // Not enough food → go home
-                                        if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
-                                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
-                                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
-                                            ch.state = AiState::MoveTo(hx, hy);
+                                        // Only married/widowed characters can explore and expand
+                                        let can_lead = matches!(ch.marital, MaritalStatus::Married | MaritalStatus::Widowed);
+
+                                        // Check if we can explore (enough stored food)
+                                        let house_storage = houses.iter()
+                                            .find(|h| h.id == ch.house_id)
+                                            .map(|h| h.storage)
+                                            .unwrap_or(0);
+                                        let can_explore = can_lead && house_storage >= 8;
+
+                                        info!(
+                                            "[AI_DEBUG] House#{} char can_lead={} storage={} => can_explore={}",
+                                            ch.house_id, can_lead, house_storage, can_explore,
+                                        );
+
+                                        if can_explore {
+                                            let angle = rand::random::<f32>() * std::f32::consts::TAU;
+                                            info!(
+                                                "[EXPLORE] House #{} adult exploring at ({:.0}, {:.0}) dir ({:.2}, {:.2})",
+                                                ch.house_id, pos.0, pos.1, angle.cos(), angle.sin(),
+                                            );
+                                            ch.state = AiState::Exploring {
+                                                origin_x: pos.0, origin_y: pos.1,
+                                                dir_x: angle.cos(), dir_y: angle.sin(),
+                                            };
+                                            ch.timer = 2.0;
+                                        } else {
+                                            // Not enough food → go home
+                                            if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
+                                                let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                                                let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
+                                                ch.state = AiState::MoveTo(hx, hy, true);
+                                            }
                                         }
                                     }
                                 }
@@ -578,7 +686,7 @@ fn character_ai(
                 }
             }
 
-            AiState::MoveTo(wx, wy) => {
+            AiState::MoveTo(wx, wy, purposeful) => {
                 let dx = wx - pos.0;
                 let dy = wy - pos.1;
                 let dist = (dx * dx + dy * dy).sqrt();
@@ -598,15 +706,29 @@ fn character_ai(
                         ch.timer = 3.0;
                     }
                 } else {
+                    // Terrain + path memory biased direction
+                    let (bdx, bdy) = biased_dir((pos.0, pos.1), (wx, wy), &map, &path_memory, &farm_set);
                     let tile_speed = tile_speed_multiplier(&map, &tf);
                     let speed = ch.speed * scale.speed as f32 * tile_speed;
-                    tf.translation.x += dx / dist * speed * time.delta_secs();
-                    tf.translation.y += dy / dist * speed * time.delta_secs();
+                    tf.translation.x += bdx * speed * time.delta_secs();
+                    tf.translation.y += bdy * speed * time.delta_secs();
 
-                    // Road wear — track frequently-walked tiles
-                    let (rtx, rty) = current_tile(&tf);
-                    if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
-                        road_wear.wear[rty * MAP_WIDTH + rtx] += 1;
+                    // Push away from farmland if not heading there for work
+                    let (ntx, nty) = current_tile(&tf);
+                    let dest_is_farm = farm_set.contains(&((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize));
+                    if !dest_is_farm && farm_set.contains(&(ntx, nty)) {
+                        // Undo the last step — slide back off the farm tile
+                        tf.translation.x -= bdx * speed * time.delta_secs() * 2.0;
+                        tf.translation.y -= bdy * speed * time.delta_secs() * 2.0;
+                    }
+
+                    // Road wear & path memory — only for purposeful movement
+                    if purposeful {
+                        let (rtx, rty) = current_tile(&tf);
+                        if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
+                            road_wear.wear[rty * MAP_WIDTH + rtx] += 2;
+                            path_memory.counts[rty * MAP_WIDTH + rtx] += 1;
+                        }
                     }
                 }
             }
@@ -624,16 +746,55 @@ fn character_ai(
                     // Arrived at shop — signal process_actions to handle trade
                     ch.action_tile = Some((shop_tile_x, shop_tile_y));
                 } else {
+                    let (bdx, bdy) = biased_dir((pos.0, pos.1), (shop_wx, shop_wy), &map, &path_memory, &farm_set);
+                    let tile_speed = tile_speed_multiplier(&map, &tf);
+                    let speed = ch.speed * scale.speed as f32 * tile_speed;
+                    tf.translation.x += bdx * speed * time.delta_secs();
+                    tf.translation.y += bdy * speed * time.delta_secs();
+
+                    // Push away from farmland (shop is never on a farm tile)
+                    let (ntx, nty) = current_tile(&tf);
+                    if farm_set.contains(&(ntx, nty)) {
+                        tf.translation.x -= bdx * speed * time.delta_secs() * 2.0;
+                        tf.translation.y -= bdy * speed * time.delta_secs() * 2.0;
+                    }
+
+                    // Road wear & path memory — shop visits are always purposeful
+                    let (rtx, rty) = current_tile(&tf);
+                    if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
+                        road_wear.wear[rty * MAP_WIDTH + rtx] += 2;
+                        path_memory.counts[rty * MAP_WIDTH + rtx] += 1;
+                    }
+                }
+            }
+
+            AiState::GoingToSocial(wx, wy) => {
+                let dx = wx - pos.0;
+                let dy = wy - pos.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < 2.0 {
+                    ch.state = AiState::Socializing;
+                    ch.timer = 8.0 + rand::random::<f64>() * 8.0;
+                } else {
                     let tile_speed = tile_speed_multiplier(&map, &tf);
                     let speed = ch.speed * scale.speed as f32 * tile_speed;
                     tf.translation.x += dx / dist * speed * time.delta_secs();
                     tf.translation.y += dy / dist * speed * time.delta_secs();
+                }
+            }
 
-                    // Road wear
-                    let (rtx, rty) = current_tile(&tf);
-                    if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
-                        road_wear.wear[rty * MAP_WIDTH + rtx] += 1;
+            AiState::Socializing => {
+                ch.timer -= dt;
+                if ch.timer <= 0.0 {
+                    // Done socializing — go home
+                    if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
+                        let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                        let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
+                        ch.state = AiState::MoveTo(hx, hy, false);
+                    } else {
+                        ch.state = AiState::Idle;
                     }
+                    ch.timer = 2.0;
                 }
             }
 
@@ -643,21 +804,15 @@ fn character_ai(
                 tf.translation.x += dir_x * speed * time.delta_secs();
                 tf.translation.y += dir_y * speed * time.delta_secs();
 
-                // Road wear
-                let (rtx, rty) = current_tile(&tf);
-                if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
-                    road_wear.wear[rty * MAP_WIDTH + rtx] += 1;
-                }
-
                 let (cx, cy) = (tf.translation.x, tf.translation.y);
                 let dist = ((cx - origin_x).powi(2) + (cy - origin_y).powi(2)).sqrt();
 
                 // Walked too far — go home
-                if dist > 400.0 {
+                if dist > 800.0 {
                     if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
                         let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
                         let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
-                        ch.state = AiState::MoveTo(hx, hy);
+                        ch.state = AiState::MoveTo(hx, hy, false);
                     } else {
                         ch.state = AiState::Idle;
                         ch.timer = 5.0;
@@ -675,12 +830,12 @@ fn character_ai(
                         .find(|h| h.id == ch.house_id)
                         .map(|h| h.storage)
                         .unwrap_or(0);
-                    if home_food < 10 {
+                    if home_food < 5 {
                         // Not enough food — abort and return home
                         if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
                             let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
                             let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
-                            ch.state = AiState::MoveTo(hx, hy);
+                            ch.state = AiState::MoveTo(hx, hy, true);
                         } else {
                             ch.state = AiState::Idle;
                             ch.timer = 5.0;
@@ -690,8 +845,8 @@ fn character_ai(
 
                     let (tx, ty) = current_tile(&tf);
                     let mut tree_count = 0;
-                    for dy in -3..=3isize {
-                        for dx in -3..=3isize {
+                    for dy in -5..=5isize {
+                        for dx in -5..=5isize {
                             let nx = tx as isize + dx;
                             let ny = ty as isize + dy;
                             if nx >= 0 && nx < MAP_WIDTH as isize && ny >= 0 && ny < MAP_HEIGHT as isize
@@ -702,16 +857,14 @@ fn character_ai(
                         }
                     }
 
-                    if tree_count >= 3 {
+                    if tree_count >= 2 {
                         // Found trees — try to build a new settlement
                         let (mx, my) = tile_center(tx, ty);
                         if let Some((plot, house_tile, char_tile)) =
-                            find_expansion_site(&map, &tree_mask, &existing, mx, my, 10)
+                            find_expansion_site(&map, &tree_mask, &existing, mx, my, 10, &road_mask)
                         {
                             let sid = next_id.0;
                             next_id.0 += 1;
-                            let (r, g, b) = CHAR_COLORS[ch.house_id % CHAR_COLORS.len()];
-                            let color = Color::srgb(r, g, b);
 
                             info!(
                                 "[EXPAND] Settlement #{} — explored by #{} at ({}, {}), {} tiles",
@@ -733,7 +886,7 @@ fn character_ai(
                                             growth: 0.0,
                                         },
                                         Sprite {
-                                            color: color_for_state(CropState::Fallow),
+                                            image: assets.misc_farm_fallow.clone(),
                                             custom_size: Some(Vec2::new(TILE_SIZE - 2.0, TILE_SIZE - 2.0)),
                                             ..default()
                                         },
@@ -761,19 +914,17 @@ fn character_ai(
                                     storage: 5,
                                     essentials: HOUSE_START_ESSENTIALS / 2,
                                 },
-                                Sprite {
-                                    color: Color::srgb(0.82, 0.71, 0.55),
-                                    custom_size: Some(Vec2::new(40.0, 36.0)),
-                                    ..default()
-                                },
                                 Transform::from_xyz(hx, hy, 1.3),
                                 GlobalTransform::default(),
                                 Visibility::default(),
                             ))
-                            .with_children(|parent| spawn_house_building(parent));
+                            .with_children(|parent| spawn_house_building(parent, assets.bld_house.clone()));
 
-                            // Spawn settler
+                            // Spawn settler couple (married)
                             let (cx, cy) = tile_center(char_tile.0, char_tile.1);
+                            let couple_offset = 16.0;
+
+                            // Male settler
                             commands.spawn((
                                 Character {
                                     speed: 100.0,
@@ -784,18 +935,42 @@ fn character_ai(
                                     house_id: sid,
                                     stage: LifeStage::Adult,
                                     age: rand::random::<f64>() * 50.0 + 20.0,
+                                    gender: Gender::Male,
+                                    personality: Personality::random(),
+                                    marital: MaritalStatus::Married,
                                 },
-                                Transform::from_xyz(cx, cy, 2.0),
+                                Transform::from_xyz(cx - couple_offset, cy, 2.0),
                                 GlobalTransform::default(),
                                 Visibility::default(),
                             ))
-                            .with_children(|parent| spawn_character_sprite(parent, color));
+                            .with_children(|parent| spawn_character_sprite(parent, assets.char_male.clone()));
+
+                            // Female settler (partner)
+                            commands.spawn((
+                                Character {
+                                    speed: 100.0,
+                                    state: AiState::Idle,
+                                    timer: 1.5,
+                                    action_tile: None,
+                                    plot_id: sid,
+                                    house_id: sid,
+                                    stage: LifeStage::Adult,
+                                    age: rand::random::<f64>() * 50.0 + 20.0,
+                                    gender: Gender::Female,
+                                    personality: Personality::random(),
+                                    marital: MaritalStatus::Married,
+                                },
+                                Transform::from_xyz(cx + couple_offset, cy, 2.0),
+                                GlobalTransform::default(),
+                                Visibility::default(),
+                            ))
+                            .with_children(|parent| spawn_character_sprite(parent, assets.char_female.clone()));
 
                             // Explorer returns home
                             if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
                                 let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
                                 let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
-                                ch.state = AiState::MoveTo(hx, hy);
+                                ch.state = AiState::MoveTo(hx, hy, false);
                             }
                         }
                     }
@@ -817,6 +992,7 @@ fn process_actions(
     mut events: EventWriter<ActionEvent>,
     shop_location: Res<ShopLocation>,
     mut pending_farmland: ResMut<PendingFarmland>,
+    assets: Res<GameAssets>,
 ) {
     for (mut ch, _tf) in chars.iter_mut() {
         let Some((tx, ty)) = ch.action_tile.take() else {
@@ -846,7 +1022,7 @@ fn process_actions(
                 house_id: ch.house_id,
             });
             if let Some((hx, hy)) = home_pos {
-                ch.state = AiState::MoveTo(hx, hy);
+                ch.state = AiState::MoveTo(hx, hy, true);
             } else {
                 ch.state = AiState::Idle;
             }
@@ -872,8 +1048,9 @@ fn process_actions(
                     growth: 0.0,
                 },
                 Sprite {
-                    color: color_for_clearing(0.0),
+                    image: assets.misc_farm_fallow.clone(),
                     custom_size: Some(Vec2::new(TILE_SIZE - 2.0, TILE_SIZE - 2.0)),
+                    color: color_for_clearing(0.0),
                     ..default()
                 },
                 Transform::from_xyz(world_x, world_y, 1.0),
@@ -933,7 +1110,7 @@ fn process_actions(
                     (hx, hy)
                 });
             ch.state = if let Some((hx, hy)) = home_pos {
-                AiState::MoveTo(hx, hy)
+                AiState::MoveTo(hx, hy, true)
             } else {
                 AiState::Idle
             };
@@ -952,6 +1129,98 @@ fn process_actions(
 #[derive(Resource, Default)]
 pub struct ReproductionTimer(pub f64);
 
+/// Sim-seconds between romance checks.
+const ROMANCE_INTERVAL: f64 = 5.0;
+/// Personality compatibility threshold (0.0–1.0) for romance to succeed.
+const ROMANCE_THRESHOLD: f32 = 0.25;
+/// Base romance probability per tick for compatible pairs.
+const ROMANCE_BASE_CHANCE: f64 = 0.6;
+
+#[derive(Resource, Default)]
+pub struct RomanceTimer(pub f64);
+
+/// How compatible two personalities are (1.0 = perfect match).
+fn personality_compatibility(a: &Personality, b: &Personality) -> f32 {
+    let diffs = [
+        (a.openness - b.openness).abs(),
+        (a.conscientiousness - b.conscientiousness).abs(),
+        (a.extraversion - b.extraversion).abs(),
+        (a.agreeableness - b.agreeableness).abs(),
+        (a.neuroticism - b.neuroticism).abs(),
+    ];
+    1.0 - diffs.iter().sum::<f32>() / diffs.len() as f32
+}
+
+/// Romance system: single adults find partners based on personality compatibility.
+fn romance_system(
+    time: Res<Time>,
+    scale: Res<TimeScale>,
+    mut timer: ResMut<RomanceTimer>,
+    mut chars: Query<(Entity, &mut Character)>,
+) {
+    if scale.speed == 0.0 {
+        return;
+    }
+    let dt = time.delta_secs_f64() * scale.speed;
+    timer.0 += dt;
+    if timer.0 < ROMANCE_INTERVAL {
+        return;
+    }
+    timer.0 -= ROMANCE_INTERVAL;
+
+    // Collect all single adults: (entity, house_id, gender, personality)
+    let singles: Vec<(Entity, usize, Gender, Personality)> = chars
+        .iter()
+        .filter(|(_, ch)| ch.stage == LifeStage::Adult && ch.marital == MaritalStatus::Single)
+        .map(|(e, ch)| (e, ch.house_id, ch.gender, ch.personality))
+        .collect();
+
+    // Track which entities to marry this tick
+    let mut to_marry: Vec<Entity> = Vec::new();
+
+    for (i, &(ei, hi, gi, ref pi)) in singles.iter().enumerate() {
+        if to_marry.contains(&ei) {
+            continue;
+        }
+        // Find best compatible partner — allow same house (grown children can pair)
+        let mut best_compat = 0.0f32;
+        let mut best_j = None;
+        for (j, &(_ej, _hj, gj, ref pj)) in singles.iter().enumerate() {
+            if i == j || gj == gi { continue; }
+            let compat = personality_compatibility(pi, pj);
+            if compat > best_compat {
+                best_compat = compat;
+                best_j = Some(j);
+            }
+        }
+
+        if let Some(j) = best_j {
+            if best_compat >= ROMANCE_THRESHOLD {
+                let chance = ROMANCE_BASE_CHANCE * best_compat as f64;
+                if rand::random::<f64>() < chance {
+                    let ej = singles[j].0;
+                    if !to_marry.contains(&ej) {
+                        let hj = singles[j].1;
+                        info!(
+                            "[ROMANCE] Singles paired (compat: {:.2}, houses: {} & {}), starting new household",
+                            best_compat, hi, hj,
+                        );
+                        to_marry.push(ei);
+                        to_marry.push(ej);
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply marriage
+    for (entity, mut ch) in chars.iter_mut() {
+        if to_marry.contains(&entity) {
+            ch.marital = MaritalStatus::Married;
+        }
+    }
+}
+
 fn reproduction_system(
     time: Res<Time>,
     scale: Res<TimeScale>,
@@ -959,6 +1228,7 @@ fn reproduction_system(
     chars: Query<&Character>,
     houses: Query<&House>,
     mut commands: Commands,
+    assets: Res<GameAssets>,
 ) {
     if scale.speed == 0.0 {
         return;
@@ -970,12 +1240,17 @@ fn reproduction_system(
     timer.0 -= CHILD_BIRTH_INTERVAL;
 
     for house in houses.iter() {
-        // Couple present?
-        let adults = chars
+        // Married/widowed couple present? (both must be below reproduction age)
+        let married_adults = chars
             .iter()
-            .filter(|c| c.house_id == house.id && c.stage == LifeStage::Adult)
+            .filter(|c| {
+                c.house_id == house.id
+                    && c.stage == LifeStage::Adult
+                    && c.age < MAX_REPRODUCTION_AGE
+                    && matches!(c.marital, MaritalStatus::Married | MaritalStatus::Widowed)
+            })
             .count();
-        if adults < 2 {
+        if married_adults < 2 {
             continue;
         }
 
@@ -998,13 +1273,12 @@ fn reproduction_system(
         let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
         let ox = (rand::random::<f32>() - 0.5) * 64.0;
         let oy = (rand::random::<f32>() - 0.5) * 64.0;
-        let (r, g, b) = CHAR_COLORS[house.id % CHAR_COLORS.len()];
-
         info!(
             "[BIRTH] House #{}: child born (now {} children, storage: {})",
             house.id, children + 1, house.storage,
         );
 
+        let baby_gender = if rand::random::<f32>() < 0.5 { Gender::Male } else { Gender::Female };
         commands.spawn((
             Character {
                 speed: 80.0,
@@ -1015,6 +1289,9 @@ fn reproduction_system(
                 house_id: house.id,
                 stage: LifeStage::Child,
                 age: 0.0,
+                gender: baby_gender,
+                personality: Personality::random(),
+                marital: MaritalStatus::Single,
             },
             Growing { age: 0.0 },
             Transform::from_xyz(hx + ox, hy + oy, 2.0),
@@ -1022,7 +1299,7 @@ fn reproduction_system(
             Visibility::default(),
         ))
         .with_children(|parent| {
-            spawn_child_sprite(parent, Color::srgb(r, g, b));
+            spawn_child_sprite(parent, assets.char_child.clone());
         });
     }
 }
@@ -1031,36 +1308,132 @@ fn aging_system(
     time: Res<Time>,
     scale: Res<TimeScale>,
     mut commands: Commands,
-    mut chars: Query<(Entity, &mut Character, Option<&mut Growing>, &Transform)>,
+    mut chars: Query<(Entity, &mut Character, Option<&mut Growing>, &Transform, &mut Visibility)>,
+    children_q: Query<&Children>,
     mut death_events: ResMut<DeathEvents>,
+    mut houses: Query<&mut House>,
+    mut starvation_timer: ResMut<StarvationTimer>,
 ) {
     if scale.speed == 0.0 {
         return;
     }
+    // Clear previous frame's death tiles before recording new ones
+    death_events.tiles.clear();
     let dt = time.delta_secs_f64() * scale.speed;
-    for (entity, mut ch, mut growing, tf) in chars.iter_mut() {
+    // --- Phase 1: Age-based deaths ---
+    let mut to_die: Vec<Entity> = Vec::new();
+    for (entity, mut ch, mut growing, tf, mut vis) in chars.iter_mut() {
         ch.age += dt;
         if let Some(ref mut g) = growing {
             g.age = ch.age;
         }
         if ch.stage == LifeStage::Adult && ch.age > LIFESPAN {
+            let dx = tf.translation.x;
+            let dy = tf.translation.y;
+            let tile_x = (dx / TILE_SIZE).floor() as usize;
+            let tile_y = (dy / TILE_SIZE).floor() as usize;
             info!(
-                "[DEATH] Adult died at house #{} (age: {:.0})",
-                ch.house_id, ch.age,
+                "[DEATH] Adult died at house #{} (age: {:.0}) tile ({}, {}) — Old Age",
+                ch.house_id, ch.age, tile_x, tile_y,
             );
-            death_events.deaths.push((ch.house_id, ch.age, tf.translation.x, tf.translation.y));
+            *vis = Visibility::Hidden;
+            death_events.deaths.push((ch.house_id, ch.age, dx, dy, ch.gender, "Old Age"));
+            death_events.tiles.insert((tile_x, tile_y));
+            to_die.push(entity);
+        }
+    }
+    // Despawn age-dead entities (borrow, don't consume — starvation check still needs to_die)
+    for &entity in &to_die {
+        if let Ok(children) = children_q.get(entity) {
+            for &child in children.iter() {
+                if commands.get_entity(child).is_some() {
+                    commands.entity(child).despawn();
+                }
+            }
+        }
+        if commands.get_entity(entity).is_some() {
             commands.entity(entity).despawn();
+        }
+    }
+    // --- Phase 2: Starvation tracking ---
+    for mut house in houses.iter_mut() {
+        if house.storage == 0 {
+            *starvation_timer.0.entry(house.id).or_insert(0.0) += dt;
+        } else {
+            starvation_timer.0.remove(&house.id);
+        }
+    }
+    // --- Phase 3: Starvation deaths ---
+    let starve_kill: Vec<(usize, &'static str)> = starvation_timer.0.iter()
+        .filter(|(_, &t)| t >= STARVATION_THRESHOLD)
+        .map(|(&hid, _)| (hid, "Starvation"))
+        .collect();
+    if !starve_kill.is_empty() {
+        // Reset timers so we don't re-kill every frame
+        for &(hid, _) in &starve_kill {
+            starvation_timer.0.remove(&hid);
+        }
+        let mut to_starve: Vec<Entity> = Vec::new();
+        let mut starved_houses: Vec<usize> = Vec::new();
+        for (entity, ch, _, tf, mut vis) in chars.iter_mut() {
+            if ch.stage != LifeStage::Adult { continue; }
+            if to_die.contains(&entity) { continue; } // already marked for age death
+            if starved_houses.contains(&ch.house_id) { continue; }
+            if !starve_kill.iter().any(|&(hid, _)| hid == ch.house_id) { continue; }
+            let dx = tf.translation.x;
+            let dy = tf.translation.y;
+            let tile_x = (dx / TILE_SIZE).floor() as usize;
+            let tile_y = (dy / TILE_SIZE).floor() as usize;
+            let cause = starve_kill.iter().find(|&&(hid, _)| hid == ch.house_id).unwrap().1;
+            info!(
+                "[STARVE] Adult died at house #{} (age: {:.0}) tile ({}, {})",
+                ch.house_id, ch.age, tile_x, tile_y,
+            );
+            *vis = Visibility::Hidden;
+            death_events.deaths.push((ch.house_id, ch.age, dx, dy, ch.gender, cause));
+            death_events.tiles.insert((tile_x, tile_y));
+            to_starve.push(entity);
+            starved_houses.push(ch.house_id);
+        }
+        for entity in to_starve {
+            if let Ok(children) = children_q.get(entity) {
+                for &child in children.iter() {
+                    if commands.get_entity(child).is_some() {
+                        commands.entity(child).despawn();
+                    }
+                }
+            }
+            if commands.get_entity(entity).is_some() {
+                commands.entity(entity).despawn();
+            }
         }
     }
 }
 
-/// When an adult dies, their eldest child inherits the household.
+/// When an adult dies, widow their spouse and let the eldest child inherit.
 fn inheritance_system(
     mut commands: Commands,
-    chars: Query<(Entity, &Character, Option<&Growing>)>,
+    mut chars: Query<(Entity, &mut Character, Option<&mut Growing>)>,
     death_events: Res<DeathEvents>,
 ) {
-    for &(house_id, _age, _dx, _dy) in &death_events.deaths {
+    // First pass: widowing surviving Married adults in the same house
+    for &(house_id, _age, _dx, _dy, _gender, _cause) in &death_events.deaths {
+        for (_entity, mut ch, _growing) in chars.iter_mut() {
+            if ch.house_id == house_id
+                && ch.stage == LifeStage::Adult
+                && ch.marital == MaritalStatus::Married
+            {
+                ch.marital = MaritalStatus::Widowed;
+                info!(
+                    "[WIDOW] House #{} adult widowed — can still expand",
+                    house_id,
+                );
+            }
+        }
+    }
+
+    // Second pass: inheritance
+    for &(house_id, _age, _dx, _dy, _gender, _cause) in &death_events.deaths {
         let mut eldest: Option<(Entity, f64)> = None; // (entity, age)
         for (entity, ch, growing) in chars.iter() {
             if ch.house_id == house_id && ch.stage == LifeStage::Child {
@@ -1074,9 +1447,15 @@ fn inheritance_system(
 
         if let Some((child_entity, child_age)) = eldest {
             info!(
-                "[INHERIT] House #{}: eldest child inherits (age: {:.0})",
+                "[INHERIT] House #{}: eldest child inherits (age: {:.0}) — must expand",
                 house_id, child_age,
             );
+            // Read gender/personality from the child before removing Growing
+            let (child_gender, child_personality) = chars
+                .iter()
+                .find(|(e, _, _)| *e == child_entity)
+                .map(|(_, ch, _)| (ch.gender, ch.personality))
+                .unwrap_or((Gender::Male, Personality::random()));
             commands.entity(child_entity).remove::<Growing>();
             commands.entity(child_entity).insert(Character {
                 speed: 100.0,
@@ -1087,6 +1466,9 @@ fn inheritance_system(
                 house_id,
                 stage: LifeStage::Adult,
                 age: child_age,
+                gender: child_gender,
+                personality: child_personality,
+                marital: MaritalStatus::Widowed, // head of household — can expand
             });
         } else {
             info!("[INHERIT] House #{}: no heir — house vacant", house_id);
@@ -1094,64 +1476,75 @@ fn inheritance_system(
     }
 }
 
-/// Place a skull at each character's death location.
+/// Tracks the next grid slot per house for tombstone placement.
+#[derive(Resource, Default)]
+pub struct NextGraveSlot(std::collections::HashMap<usize, usize>);
+
+/// How close (world units) a death must be to the house for burial in the house grave plot.
+const NEARBY_DIST: f32 = TILE_SIZE * 5.0;
+
+/// Place a tombstone near the house if the character died nearby, or at the death
+/// location if they died far from home.
 fn grave_system(
     mut commands: Commands,
     mut death_events: ResMut<DeathEvents>,
+    houses: Query<&House>,
+    mut next_slot: ResMut<NextGraveSlot>,
+    assets: Res<GameAssets>,
 ) {
-    for (house_id, age, dx, dy) in death_events.deaths.drain(..) {
-        info!(
-            "[SKULL] House #{} died at age {:.0} pos ({:.0}, {:.0})",
-            house_id, age, dx, dy,
-        );
+    for (house_id, age, dx, dy, gender, cause) in death_events.deaths.drain(..) {
+        let death_tile_x = (dx / TILE_SIZE).floor() as usize;
+        let death_tile_y = (dy / TILE_SIZE).floor() as usize;
+
+        // Check if the character died near their home
+        let house_opt = houses.iter().find(|h| h.id == house_id);
+        let near_home = house_opt
+            .map(|h| {
+                let h_cx = (h.tile_x + h.w / 2) as f32 * TILE_SIZE;
+                let h_cy = (h.tile_y + h.h / 2) as f32 * TILE_SIZE;
+                let d = ((dx - h_cx).powi(2) + (dy - h_cy).powi(2)).sqrt();
+                d < NEARBY_DIST
+            })
+            .unwrap_or(false);
+
+        let (tile_x, tile_y, cx, cy) = if near_home {
+            // Grid placement below the house
+            let h = house_opt.unwrap();
+            const COLS: usize = 4;
+            let slot = next_slot.0.entry(house_id).or_insert(0);
+            let row = *slot / COLS;
+            let col = *slot % COLS;
+            *slot += 1;
+            let gx = h.tile_x + col;
+            let gy = h.tile_y.saturating_sub(1 + row);
+            let (wc_x, wc_y) = tile_center(gx, gy);
+            info!(
+                "[SKULL] House #{} died at age {:.0} → grave ({}, {}) slot {}",
+                house_id, age, gx, gy, slot,
+            );
+            (gx, gy, wc_x, wc_y)
+        } else {
+            // Remote death — place tombstone at the death location
+            let (wc_x, wc_y) = tile_center(death_tile_x, death_tile_y);
+            info!(
+                "[SKULL] House #{} died at age {:.0} → remote grave ({}, {})",
+                house_id, age, death_tile_x, death_tile_y,
+            );
+            (death_tile_x, death_tile_y, wc_x, wc_y)
+        };
 
         commands.spawn((
             Grave,
-            GraveInfo { age, house_id, cause: "Old Age" },
+            GraveInfo { age, house_id, gender, cause },
             Sprite {
-                color: Color::srgb(0.92, 0.88, 0.82),
-                custom_size: Some(Vec2::new(10.0, 10.0)),
+                image: assets.misc_tombstone.clone(),
+                custom_size: Some(Vec2::new(20.0, 20.0)),
                 ..default()
             },
-            Transform::from_xyz(dx, dy, 1.5),
+            Transform::from_xyz(cx, cy, 1.5),
             GlobalTransform::default(),
             Visibility::default(),
-        ))
-        .with_children(|parent| {
-            // Left eye
-            parent.spawn((
-                Sprite {
-                    color: Color::srgb(0.10, 0.10, 0.10),
-                    custom_size: Some(Vec2::new(2.0, 2.5)),
-                    ..default()
-                },
-                Transform::from_xyz(-2.5, 1.0, 0.01),
-                GlobalTransform::default(),
-                Visibility::default(),
-            ));
-            // Right eye
-            parent.spawn((
-                Sprite {
-                    color: Color::srgb(0.10, 0.10, 0.10),
-                    custom_size: Some(Vec2::new(2.0, 2.5)),
-                    ..default()
-                },
-                Transform::from_xyz(2.5, 1.0, 0.01),
-                GlobalTransform::default(),
-                Visibility::default(),
-            ));
-            // Mouth
-            parent.spawn((
-                Sprite {
-                    color: Color::srgb(0.10, 0.10, 0.10),
-                    custom_size: Some(Vec2::new(4.0, 1.0)),
-                    ..default()
-                },
-                Transform::from_xyz(0.0, -2.5, 0.01),
-                GlobalTransform::default(),
-                Visibility::default(),
-            ));
-        });
+        ));
     }
 }
 
@@ -1161,45 +1554,13 @@ fn child_growth_system(
     mut commands: Commands,
     mut chars: Query<(Entity, &mut Character, &mut Growing, &Transform)>,
     adults: Query<&Character, Without<Growing>>,
-    farm_tiles: Query<&FarmTile>,
-    houses: Query<&House>,
-    vegetation: Query<(&Vegetation, &Transform), Without<Character>>,
-    map: Res<Map>,
-    mut next_id: ResMut<NextSettlementId>,
-    mut pending_farmland: ResMut<PendingFarmland>,
+    children_q: Query<&Children>,
+    assets: Res<GameAssets>,
 ) {
     if scale.speed == 0.0 {
         return;
     }
     let dt = time.delta_secs_f64() * scale.speed;
-
-    let existing_plots: Vec<(usize, usize)> = {
-        let mut list: Vec<(usize, usize)> = farm_tiles.iter().map(|ft| (ft.tile_x, ft.tile_y)).collect();
-        for house in houses.iter() {
-            for dx in 0..house.w {
-                for dy in 0..house.h {
-                    list.push((house.tile_x + dx, house.tile_y + dy));
-                }
-            }
-        }
-        for tiles in pending_farmland.plots.values() {
-            list.extend(tiles.iter().copied());
-        }
-        list
-    };
-
-    // Build a mask of tiles that have trees (wood source for building)
-    let mut tree_mask = vec![false; MAP_WIDTH * MAP_HEIGHT];
-    for (veg, tf) in vegetation.iter() {
-        let is_tree = matches!(veg.kind, VegetationKind::DeciduousTree | VegetationKind::PineTree | VegetationKind::PalmTree);
-        if is_tree {
-            let tx = (tf.translation.x / TILE_SIZE) as usize;
-            let ty = (tf.translation.y / TILE_SIZE) as usize;
-            if tx < MAP_WIDTH && ty < MAP_HEIGHT {
-                tree_mask[ty * MAP_WIDTH + tx] = true;
-            }
-        }
-    }
 
     // Count adults per house (using a Without<Growing> query for disjoint access)
     let mut adult_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -1209,7 +1570,7 @@ fn child_growth_system(
         }
     }
 
-    let mut to_grow: Vec<(Entity, f32, f32, usize, usize)> = Vec::new();
+    let mut to_grow: Vec<(Entity, f32, f32, usize, usize, Gender, Personality)> = Vec::new();
 
     for (entity, ch, mut growing, tf) in chars.iter_mut() {
         if ch.stage != LifeStage::Child {
@@ -1217,143 +1578,48 @@ fn child_growth_system(
         }
         growing.age += dt;
         if growing.age >= CHILD_GROWTH_DURATION {
-            to_grow.push((entity, tf.translation.x, tf.translation.y, ch.plot_id, ch.house_id));
+            to_grow.push((entity, tf.translation.x, tf.translation.y, ch.plot_id, ch.house_id, ch.gender, ch.personality));
         }
     }
 
-    for (entity, x, y, _plot_id, house_id) in to_grow {
-        commands.entity(entity).despawn();
-
+    for (entity, _x, _y, _plot_id, house_id, gender, personality) in to_grow {
         let adult_count = adult_counts.get(&house_id).copied().unwrap_or(0);
-        let (r, g, b) = CHAR_COLORS[house_id % CHAR_COLORS.len()];
-        let color = Color::srgb(r, g, b);
+        info!(
+            "[GROW] House #{}: child grew up (now {} adults) — staying home as helper until married",
+            house_id, adult_count + 1,
+        );
 
-        // If parents are still alive, the grown child may move out.
-        if adult_count >= 2 {
-            // Find the parents' house position
-            let home_pos = houses.iter().find(|h| h.id == house_id).map(|h| {
-                ((h.tile_x as f32 + h.w as f32 / 2.0) * TILE_SIZE,
-                 (h.tile_y as f32 + h.h as f32 / 2.0) * TILE_SIZE)
-            });
-
-            if let Some((hx, hy)) = home_pos {
-                // Search for a suitable expansion site
-                if let Some((plot, house_tile, char_tile)) =
-                    find_expansion_site(&map, &tree_mask, &existing_plots, hx, hy, 10)
-                {
-                    let sid = next_id.0;
-                    next_id.0 += 1;
-
-                    info!(
-                        "[EXPAND] Settlement #{} founded at ({}, {}) — {} tiles, parent house #{}",
-                        sid, house_tile.0, house_tile.1, plot.len(), house_id,
-                    );
-
-                    // Spawn 2 starter tiles, rest as pending
-                    let mut pending = Vec::new();
-                    for (i, &(fx, fy)) in plot.iter().enumerate() {
-                        if i < 2 {
-                            let wx = fx as f32 * TILE_SIZE + TILE_SIZE / 2.0;
-                            let wy = fy as f32 * TILE_SIZE + TILE_SIZE / 2.0;
-                            commands.spawn((
-                                FarmTile {
-                                    plot: sid,
-                                    tile_x: fx,
-                                    tile_y: fy,
-                                    state: CropState::Fallow,
-                                    growth: 0.0,
-                                },
-                                Sprite {
-                                    color: color_for_state(CropState::Fallow),
-                                    custom_size: Some(Vec2::new(TILE_SIZE - 2.0, TILE_SIZE - 2.0)),
-                                    ..default()
-                                },
-                                Transform::from_xyz(wx, wy, 1.0),
-                                GlobalTransform::default(),
-                                Visibility::default(),
-                            ));
-                        } else {
-                            pending.push((fx, fy));
-                        }
-                    }
-                    if !pending.is_empty() {
-                        pending_farmland.plots.insert(sid, pending);
-                    }
-
-                    // Spawn house
-                    let (hx, hy) = tile_center(house_tile.0, house_tile.1);
-                    commands.spawn((
-                        House {
-                            id: sid,
-                            tile_x: house_tile.0,
-                            tile_y: house_tile.1,
-                            w: 2,
-                            h: 2,
-                            storage: 5,
-                            essentials: HOUSE_START_ESSENTIALS / 2,
-                        },
-                        Sprite {
-                            color: Color::srgb(0.82, 0.71, 0.55),
-                            custom_size: Some(Vec2::new(40.0, 36.0)),
-                            ..default()
-                        },
-                        Transform::from_xyz(hx, hy, 1.3),
-                        GlobalTransform::default(),
-                        Visibility::default(),
-                    ))
-                    .with_children(|parent| spawn_house_building(parent));
-
-                    // Spawn settler character
-                    let (cx, cy) = tile_center(char_tile.0, char_tile.1);
-                    commands.spawn((
-                        Character {
-                            speed: 100.0,
-                            state: AiState::Idle,
-                            timer: 1.0,
-                            action_tile: None,
-                            plot_id: sid,
-                            house_id: sid,
-                            stage: LifeStage::Adult,
-                            age: rand::random::<f64>() * 50.0 + 20.0,
-                        },
-                        Transform::from_xyz(cx, cy, 2.0),
-                        GlobalTransform::default(),
-                        Visibility::default(),
-                    ))
-                    .with_children(|parent| spawn_character_sprite(parent, color));
-
-                    continue;
-                } else {
-                    info!(
-                        "[GROW] House #{}: child grew up — expansion FAILED (no land), staying at home",
-                        house_id,
-                    );
-                }
+        // Despawn old child sprites (cleanup to prevent ghost sprites)
+        if let Ok(children) = children_q.get(entity) {
+            for &child in children.iter() {
+                commands.entity(child).despawn();
             }
-        } else {
-            info!(
-                "[GROW] House #{}: child grew up — staying at home (helper, now {} adults)",
-                house_id, adult_count + 1,
-            );
         }
 
-        // Stay at home: grow up on the original plot
-        commands.spawn((
-            Character {
-                speed: 100.0,
-                state: AiState::Idle,
-                timer: 1.0,
-                action_tile: None,
-                plot_id: house_id, // same plot as parents
-                house_id,
-                stage: LifeStage::Adult,
-                age: CHILD_GROWTH_DURATION,
-            },
-            Transform::from_xyz(x, y, 2.0),
-            GlobalTransform::default(),
-            Visibility::default(),
-        ))
-        .with_children(|parent| spawn_character_sprite(parent, color));
+        // Convert in-place: remove Growing, update Character to adult
+        commands.entity(entity).remove::<Growing>();
+        commands.entity(entity).insert(Character {
+            speed: 100.0,
+            state: AiState::Idle,
+            timer: 1.0,
+            action_tile: None,
+            plot_id: house_id,
+            house_id,
+            stage: LifeStage::Adult,
+            age: CHILD_GROWTH_DURATION,
+            gender,
+            personality,
+            marital: MaritalStatus::Single,
+        });
+
+        // Spawn new adult sprite (gender-correct)
+        let tex = match gender {
+            Gender::Male => assets.char_male.clone(),
+            Gender::Female => assets.char_female.clone(),
+        };
+        commands.entity(entity).with_children(|parent| {
+            spawn_character_sprite(parent, tex);
+        });
     }
 }
 
@@ -1370,6 +1636,7 @@ fn find_expansion_site(
     near_x: f32,
     near_y: f32,
     target_size: usize,
+    road_mask: &[bool],
 ) -> Option<SettlementSite> {
     let arable = [TileType::Grass, TileType::Meadow];
     let start_x = (near_x / TILE_SIZE) as isize;
@@ -1392,6 +1659,13 @@ fn find_expansion_site(
                     occupied[ny as usize * MAP_WIDTH + nx as usize] = true;
                 }
             }
+        }
+    }
+
+    // Road tiles are occupied — houses cannot be built on paths
+    for (idx, has_road) in road_mask.iter().enumerate() {
+        if *has_road {
+            occupied[idx] = true;
         }
     }
 
@@ -1520,7 +1794,7 @@ pub struct MealTimer(pub f64);
 pub struct ChildMealTimer(pub f64);
 
 /// Next available settlement ID (house_id + plot_id).
-/// Starts at 3 because the initial map has 3 settlements (IDs 0, 1, 2).
+/// Starts at 1 because the initial map has 1 settlement (ID 0).
 #[derive(Resource)]
 pub struct NextSettlementId(pub usize);
 
@@ -1530,11 +1804,17 @@ impl Default for NextSettlementId {
     }
 }
 
-/// Death info: house_id, age, world_x, world_y (for inheritance + skull placement).
+/// Death info: house_id, age, world_x, world_y, gender, cause (for inheritance + skull placement).
 #[derive(Resource, Default)]
 pub struct DeathEvents {
-    pub deaths: Vec<(usize, f64, f32, f32)>,
+    pub deaths: Vec<(usize, f64, f32, f32, Gender, &'static str)>,
+    /// Tiles where deaths occurred this frame — used synchronously by UI to hide dead chars.
+    pub tiles: std::collections::HashSet<(usize, usize)>,
 }
+
+/// Tracks how long each house has been at 0 food.
+#[derive(Resource, Default)]
+pub struct StarvationTimer(pub std::collections::HashMap<usize, f64>);
 
 /// Tile position of the village shop.
 #[derive(Resource)]
@@ -1561,7 +1841,7 @@ impl Default for RoadWear {
     }
 }
 
-/// Tracks which tiles already have a road overlay sprite.
+/// Tracks which tiles have a road overlay sprite.
 #[derive(Resource)]
 pub struct RoadRender {
     pub tiles: Vec<Option<Entity>>,
@@ -1570,6 +1850,19 @@ pub struct RoadRender {
 impl Default for RoadRender {
     fn default() -> Self {
         Self { tiles: vec![None; MAP_WIDTH * MAP_HEIGHT] }
+    }
+}
+
+/// Global path memory — counts purposeful traversals per tile.
+/// Used to bias character movement toward known routes.
+#[derive(Resource)]
+pub struct PathMemory {
+    pub counts: Vec<u32>,
+}
+
+impl Default for PathMemory {
+    fn default() -> Self {
+        Self { counts: vec![0; MAP_WIDTH * MAP_HEIGHT] }
     }
 }
 
@@ -1672,8 +1965,8 @@ fn daily_consumption(
 
     // Adults: eat daily
     timer.0 += dt;
-    if timer.0 >= DAY_SECONDS {
-        timer.0 -= DAY_SECONDS;
+    if timer.0 >= MEAL_INTERVAL {
+        timer.0 -= MEAL_INTERVAL;
         for ch in chars.iter() {
             if ch.stage == LifeStage::Child {
                 continue;
@@ -1691,8 +1984,8 @@ fn daily_consumption(
 
     // Children: eat every 2 days
     child_timer.0 += dt;
-    if child_timer.0 >= DAY_SECONDS * 2.0 {
-        child_timer.0 -= DAY_SECONDS * 2.0;
+    if child_timer.0 >= MEAL_INTERVAL * 2.0 {
+        child_timer.0 -= MEAL_INTERVAL * 2.0;
         for ch in chars.iter() {
             if ch.stage != LifeStage::Child {
                 continue;

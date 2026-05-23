@@ -3,8 +3,8 @@ use bevy::prelude::*;
 use crate::element_config::Interaction;
 use crate::farmland::{CropState, FarmTile};
 use crate::lang::{tr, GameLang};
-use crate::map::{Map, TerrainData, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
-use crate::player::{Character, GraveInfo, House, LifeStage};
+use crate::map::{Map, TerrainData, TileCategory, TileContent, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
+use crate::player::{Character, DeathEvents, Gender, GraveInfo, House, LifeStage, MaritalStatus};
 use crate::sim_time::{SimTime, TimeScale};
 
 // ---------------------------------------------------------------------------
@@ -110,8 +110,10 @@ fn update_info_panel(
     hovered: Res<HoveredTile>,
     map: Res<Map>,
     terrain_data: Res<TerrainData>,
+    tile_content: Res<TileContent>,
     sim: Res<SimTime>,
     scale: Res<TimeScale>,
+    death_events: Res<DeathEvents>,
     house_q: Query<(&House, &Transform)>,
     char_q: Query<(&Character, &Transform)>,
     farm_q: Query<&FarmTile>,
@@ -123,11 +125,8 @@ fn update_info_panel(
     };
     let l = lang.0;
 
-    // Time display
-    let total_secs = sim.elapsed as u64;
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
+    // Time display as calendar date
+    let (y, m, d) = sim.date();
     let speed_label = if scale.speed == 0.0 {
         tr("PAUSED", l)
     } else {
@@ -136,13 +135,13 @@ fn update_info_panel(
     let mut lines = Vec::new();
     if scale.speed == 0.0 {
         lines.push(format!(
-            "{} {:02}:{:02}:{:02}  [{}]",
-            tr("Time", l), hours, mins, secs, speed_label
+            "{} {:04}-{:02}-{:02}  [{}]",
+            tr("Time", l), y, m + 1, d + 1, speed_label
         ));
     } else {
         lines.push(format!(
-            "{} {:02}:{:02}:{:02}  {}{:.1}",
-            tr("Time", l), hours, mins, secs, speed_label, scale.speed
+            "{} {:04}-{:02}-{:02}  {}{:.1}",
+            tr("Time", l), y, m + 1, d + 1, speed_label, scale.speed
         ));
     }
 
@@ -172,17 +171,68 @@ fn update_info_panel(
             }
         ));
     }
+
+    // Tile overlay content (resources, vegetation, features, buildings)
+    if let Some(entries) = tile_content.data.get(&idx) {
+        for entry in entries {
+            let cat_zh = match entry.category {
+                TileCategory::Resource => tr("Resource", l),
+                TileCategory::Vegetation => tr("Vegetation", l),
+                TileCategory::Feature => tr("Feature", l),
+                TileCategory::Building => tr("Building", l),
+                TileCategory::Cave => tr("Cave", l),
+            };
+            let name = tr(entry.name, l);
+            if entry.amount > 0 {
+                lines.push(format!("  {}  |  {}  |  {}: {}", cat_zh, name, tr("Amount", l), entry.amount));
+            } else {
+                lines.push(format!("  {}  |  {}", cat_zh, name));
+            }
+        }
+    }
+
     lines.push(tr("── Z Layers ──", l).to_string());
+
+    // Check if a death happened at this tile this frame (before tombstone exists)
+    let death_this_frame = death_events.tiles.contains(&(tx, ty));
 
     for (ch, tf) in char_q.iter() {
         let px = (tf.translation.x / TILE_SIZE).floor() as isize;
         let py = (tf.translation.y / TILE_SIZE).floor() as isize;
         if px >= 0 && py >= 0 && px as usize == tx && py as usize == ty {
+            // Skip characters that died this frame (ghost prevention)
+            if death_this_frame {
+                continue;
+            }
             let role = match ch.stage {
                 LifeStage::Child => tr("Child", l),
                 LifeStage::Adult => tr("Adult", l),
             };
-            lines.push(format!("+2.0  {} ({})", role, tr("character", l)));
+            let gender_str = match ch.gender {
+                Gender::Male => tr("Male", l),
+                Gender::Female => tr("Female", l),
+            };
+            let marital_str = match ch.marital {
+                MaritalStatus::Single => tr("Single", l),
+                MaritalStatus::Married => tr("Married", l),
+                MaritalStatus::Widowed => tr("Widowed", l),
+            };
+            lines.push(format!("+2.0  {} {} ({})  [{}]",
+                gender_str, role, tr("character", l), marital_str));
+            // Show top 2 personality traits
+            let p = &ch.personality;
+            let mut traits = vec![
+                (tr("Openness", l), p.openness),
+                (tr("Conscientiousness", l), p.conscientiousness),
+                (tr("Extraversion", l), p.extraversion),
+                (tr("Agreeableness", l), p.agreeableness),
+                (tr("Neuroticism", l), p.neuroticism),
+            ];
+            traits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let trait_strs: Vec<String> = traits.iter().map(|(name, val)| {
+                format!("{}: {:.0}%", name, val * 100.0)
+            }).collect();
+            lines.push(format!("  {}", trait_strs.join("  |  ")));
         }
     }
 
@@ -220,7 +270,11 @@ fn update_info_panel(
         let gy = (tf.translation.y / TILE_SIZE).floor() as isize;
         if gx >= 0 && gy >= 0 && gx as usize == tx && gy as usize == ty {
             lines.push(format!("+1.0  {}", tr("Tombstone", l)));
-            lines.push(format!("  {}: #{}  {}: {:.0}", tr("House", l), info.house_id, tr("Age", l), info.age));
+            let gstr = match info.gender {
+                Gender::Male => tr("Male", l),
+                Gender::Female => tr("Female", l),
+            };
+            lines.push(format!("  {} {}  {}: #{}  {}: {:.0}", gstr, tr("Tombstone", l), tr("House", l), info.house_id, tr("Age", l), info.age));
             lines.push(format!("  {}: {}", tr("Cause", l), tr(info.cause, l)));
         }
     }

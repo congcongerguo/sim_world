@@ -207,6 +207,9 @@ impl Plugin for MapPlugin {
 // Systems
 // ---------------------------------------------------------------------------
 
+/// Pixels-per-tile for the terrain texture (each map tile = 32×32 px).
+const TERRAIN_TILE_PX: u32 = 32;
+
 fn spawn_map(
     mut commands: Commands,
     mut map: ResMut<Map>,
@@ -222,21 +225,31 @@ fn spawn_map(
     // After this, all runtime code reads from TerrainData, never from config.
     let td = TerrainData::bake();
 
-    // Build procedural texture from tile data using the baked RGBA values.
-    // Texture row 0 = top of image = top of sprite = highest world Y.
-    // World tile (x, y=0) is at the bottom → texture row MAP_HEIGHT-1.
-    let mut pixel_data = vec![0u8; MAP_WIDTH * MAP_HEIGHT * 4];
+    // Build a placeholder terrain texture at full resolution (3200×3200 px).
+    // Each 32×32 block is filled with the flat terrain colour.
+    // An Update system (build_terrain_texture) will replace the pixel data
+    // with tiled pixel-art once the generated tile images are loaded.
+    let tex_w = MAP_WIDTH as u32 * TERRAIN_TILE_PX;
+    let tex_h = MAP_HEIGHT as u32 * TERRAIN_TILE_PX;
+    let mut pixel_data = vec![0u8; (tex_w * tex_h * 4) as usize];
+
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
             let idx = y * MAP_WIDTH + x;
             let tile = map.tiles[idx];
             let rgba = td.rgbs[tile as u8 as usize];
-            let data_y = MAP_HEIGHT - 1 - y; // flip Y
-            let pi = (data_y * MAP_WIDTH + x) * 4;
-            pixel_data[pi + 0] = rgba[0];
-            pixel_data[pi + 1] = rgba[1];
-            pixel_data[pi + 2] = rgba[2];
-            pixel_data[pi + 3] = rgba[3];
+            // Y-flip: texture row 0 = top = highest world Y
+            let dst_y_base = (MAP_HEIGHT - 1 - y) as u32 * TERRAIN_TILE_PX;
+
+            for ty in 0..TERRAIN_TILE_PX {
+                for tx in 0..TERRAIN_TILE_PX {
+                    let pi = ((dst_y_base + ty) * tex_w + x as u32 * TERRAIN_TILE_PX + tx) as usize * 4;
+                    pixel_data[pi + 0] = rgba[0];
+                    pixel_data[pi + 1] = rgba[1];
+                    pixel_data[pi + 2] = rgba[2];
+                    pixel_data[pi + 3] = rgba[3];
+                }
+            }
         }
     }
 
@@ -249,8 +262,8 @@ fn spawn_map(
 
     let mut image = Image::new(
         Extent3d {
-            width: MAP_WIDTH as u32,
-            height: MAP_HEIGHT as u32,
+            width: tex_w,
+            height: tex_h,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -386,14 +399,21 @@ fn tile_edit_input(
     let new_type = selected.0;
     map.set(tx, ty, new_type);
 
-    // Update the terrain texture pixel(s).
+    // Update the terrain texture — write a 32×32 block.
     if let Some(image) = images.get_mut(&map_image.0) {
         let rgba = terrain_data.rgbs[new_type as u8 as usize];
         let data_y = MAP_HEIGHT - 1 - ty; // flip Y
-        let pi = (data_y * MAP_WIDTH + tx) * 4;
-        image.data[pi] = rgba[0];
-        image.data[pi + 1] = rgba[1];
-        image.data[pi + 2] = rgba[2];
-        image.data[pi + 3] = rgba[3];
+        let tex_w = MAP_WIDTH as u32 * TERRAIN_TILE_PX;
+
+        for py in 0..TERRAIN_TILE_PX {
+            for px in 0..TERRAIN_TILE_PX {
+                let pi = ((data_y as u32 * TERRAIN_TILE_PX + py) * tex_w
+                    + tx as u32 * TERRAIN_TILE_PX + px) as usize * 4;
+                image.data[pi] = rgba[0];
+                image.data[pi + 1] = rgba[1];
+                image.data[pi + 2] = rgba[2];
+                image.data[pi + 3] = rgba[3];
+            }
+        }
     }
 }

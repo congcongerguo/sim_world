@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
+use crate::assets::GameAssets;
 use crate::element_config::{Interaction, RESOURCE_CONFIGS};
 use crate::map::{Map, TileCategory, TileContent, TileEntry, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_rng::SimRng;
@@ -58,12 +59,25 @@ impl Plugin for ResourcePlugin {
 // System
 // ---------------------------------------------------------------------------
 
+fn res_texture<'a>(kind: ResourceKind, assets: &'a GameAssets) -> &'a Handle<Image> {
+    match kind {
+        ResourceKind::IronOre => &assets.res_iron_ore,
+        ResourceKind::CoalOre => &assets.res_coal,
+        ResourceKind::CopperOre => &assets.res_copper_ore,
+        ResourceKind::GoldOre => &assets.res_gold_ore,
+        ResourceKind::ClayDeposit => &assets.res_clay,
+        ResourceKind::SandDeposit => &assets.res_sand,
+        ResourceKind::StoneDeposit => &assets.res_stone,
+    }
+}
+
 fn spawn_resources(
     mut commands: Commands,
     map: Res<Map>,
     mut rng: ResMut<SimRng>,
     mut counts: ResMut<ResourceCounts>,
     mut tile_content: ResMut<TileContent>,
+    assets: Res<GameAssets>,
 ) {
     counts.by_kind.clear();
 
@@ -82,6 +96,7 @@ fn spawn_resources(
                 let world_x = x as f32 * TILE_SIZE + TILE_SIZE / 2.0;
                 let world_y = y as f32 * TILE_SIZE + TILE_SIZE / 2.0;
 
+                let tex = res_texture(cfg.kind, &assets).clone();
                 commands.spawn((
                     Resource {
                         kind: cfg.kind,
@@ -90,7 +105,7 @@ fn spawn_resources(
                         interaction: cfg.interaction,
                     },
                     Sprite {
-                        color: cfg.color,
+                        image: tex,
                         custom_size: Some(Vec2::new(cfg.overlay_size, cfg.overlay_size)),
                         anchor: Anchor::Center,
                         ..default()

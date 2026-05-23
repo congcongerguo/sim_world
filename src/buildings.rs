@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
+use crate::assets::GameAssets;
 use crate::element_config::{Interaction, BUILDING_CONFIGS};
 use crate::map::{Map, OccupancyGrid, TileCategory, TileContent, TileEntry, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_rng::SimRng;
@@ -50,12 +51,23 @@ impl Plugin for BuildingPlugin {
 // System
 // ---------------------------------------------------------------------------
 
+fn building_texture<'a>(kind: BuildingKind, assets: &'a GameAssets) -> &'a Handle<Image> {
+    match kind {
+        BuildingKind::House => &assets.bld_house,
+        BuildingKind::StoneHouse => &assets.bld_stone_house,
+        BuildingKind::Watchtower => &assets.bld_watchtower,
+        BuildingKind::Workshop => &assets.bld_workshop,
+        BuildingKind::Well => &assets.bld_well,
+    }
+}
+
 fn spawn_buildings(
     mut commands: Commands,
     map: Res<Map>,
     mut rng: ResMut<SimRng>,
     mut occ: ResMut<OccupancyGrid>,
     mut tile_content: ResMut<TileContent>,
+    assets: Res<GameAssets>,
 ) {
     // Sort by area descending so larger buildings get first pick of locations.
     let mut cfgs: Vec<_> = BUILDING_CONFIGS.iter().collect();
@@ -103,6 +115,7 @@ fn spawn_buildings(
                 let world_x = (x as f32 + cfg.width as f32 / 2.0) * TILE_SIZE;
                 let world_y = (y as f32 + cfg.height as f32 / 2.0) * TILE_SIZE;
 
+                let tex = building_texture(cfg.kind, &assets).clone();
                 let entity = commands
                     .spawn((
                         Building {
@@ -113,11 +126,8 @@ fn spawn_buildings(
                             size: UVec2::new(cfg.width as u32, cfg.height as u32),
                         },
                         Sprite {
-                            color: cfg.color,
-                            custom_size: Some(Vec2::new(
-                                cfg.width as f32 * TILE_SIZE,
-                                cfg.height as f32 * TILE_SIZE,
-                            )),
+                            image: tex,
+                            custom_size: Some(Vec2::new(TILE_SIZE, TILE_SIZE)),
                             anchor: Anchor::Center,
                             ..default()
                         },

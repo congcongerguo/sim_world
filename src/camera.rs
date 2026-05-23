@@ -64,7 +64,7 @@ fn camera_control(
         return;
     };
 
-    // --- zoom (centered on cursor) ---
+    // --- zoom (centered on cursor, reversed: scroll up = zoom out) ---
     let cursor_pos = windows
         .get_single()
         .ok()
@@ -72,7 +72,8 @@ fn camera_control(
 
     for ev in scroll_events.read() {
         let old_scale = projection.scale;
-        projection.scale = (projection.scale * (1.0_f32 + ev.y * 0.15_f32))
+        // Reversed: scroll up (positive y) zooms out, scroll down zooms in
+        projection.scale = (projection.scale * (1.0_f32 - ev.y * 0.15_f32))
             .clamp(0.1_f32, 100.0_f32);
         let new_scale = projection.scale;
 
@@ -97,8 +98,9 @@ fn camera_control(
     if mouse.pressed(MouseButton::Left) {
         if let (Some(pos), Some(last)) = (cursor, pan_state.last_cursor) {
             let delta = pos - last;
-            transform.translation.x -= delta.x;
-            transform.translation.y += delta.y;
+            // Scale pan speed by zoom level so drag distance matches world distance
+            transform.translation.x -= delta.x * projection.scale;
+            transform.translation.y += delta.y * projection.scale;
         }
         pan_state.last_cursor = cursor;
     } else {

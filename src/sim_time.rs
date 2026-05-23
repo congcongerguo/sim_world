@@ -1,6 +1,15 @@
 use bevy::prelude::*;
 
 // ---------------------------------------------------------------------------
+// Time units — 1 tick = 1 day, 1 month = 30 days, 1 year = 12 months = 360 days
+// ---------------------------------------------------------------------------
+
+/// 1 month in ticks (30 days).
+pub const MONTH: f64 = 30.0;
+/// 1 year in ticks (12 months = 360 days).
+pub const YEAR: f64 = 360.0;
+
+// ---------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------
 
@@ -52,6 +61,18 @@ impl TimeScale {
 #[derive(Resource, Default)]
 pub struct SimTime {
     pub elapsed: f64,
+}
+
+impl SimTime {
+    /// Returns (years, months, days) since epoch.
+    pub fn date(&self) -> (u64, u64, u64) {
+        let d = self.elapsed;
+        let y = (d / YEAR) as u64;
+        let rem = d % YEAR;
+        let m = (rem / MONTH) as u64;
+        let day = (rem % MONTH) as u64;
+        (y, m, day)
+    }
 }
 
 // ---------------------------------------------------------------------------

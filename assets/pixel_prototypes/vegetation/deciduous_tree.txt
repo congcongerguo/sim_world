@@ -1,0 +1,15 @@
+deciduous_tree - 落叶树
+
+类别: 植被 - 地图上的植物
+生成引擎: ComfyUI SDXL
+种子: 215
+像素尺寸: 32x32 (预览: 128x128)
+原始尺寸: 512x512
+
+描述: 游戏的落叶树像素艺术原型。
+使用SDXL生成后降采样为32x32像素块风格。
+
+使用方式:
+- 直接使用: assets/pixel_prototypes/vegetation/deciduous_tree.png (32x32)
+- 导入游戏: 作为TextureAtlas瓦片或独立Sprite加载
+- 建议缩放: 游戏中以TILE_SIZE(32px)显示
