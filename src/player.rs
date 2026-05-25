@@ -1495,12 +1495,12 @@ fn movement_system(
                 tf.translation.x += dir_x * speed * fixed_time.delta_secs();
                 tf.translation.y += dir_y * speed * fixed_time.delta_secs();
 
-                // Hit water → go home (pathfinding will find a dry route)
+                // Hit water/lava → go home (pathfinding will find a dry route)
                 let (wtx, wty) = current_tile(&tf);
                 if wtx < MAP_WIDTH && wty < MAP_HEIGHT {
                     if matches!(
                         map.tiles[wty * MAP_WIDTH + wtx],
-                        TileType::Water | TileType::DeepWater
+                        TileType::Water | TileType::DeepWater | TileType::Lava
                     ) {
                         if let Some(house) =
                             houses.iter().find(|h| h.id == ch.house_id)
@@ -1518,9 +1518,9 @@ fn movement_system(
                     }
                 }
 
-                // Look ahead for water (3 tiles)
+                // Look ahead for water/lava (3 tiles)
                 let look_ahead = 3;
-                let mut water_ahead = false;
+                let mut danger_ahead = false;
                 for step in 1..=look_ahead {
                     let lx = (tf.translation.x + dir_x * step as f32 * TILE_SIZE)
                         / TILE_SIZE;
@@ -1536,14 +1536,14 @@ fn movement_system(
                         let li = lyi as usize * MAP_WIDTH + lxi as usize;
                         if matches!(
                             map.tiles[li],
-                            TileType::Water | TileType::DeepWater
+                            TileType::Water | TileType::DeepWater | TileType::Lava
                         ) {
-                            water_ahead = true;
+                            danger_ahead = true;
                             break;
                         }
                     }
                 }
-                if water_ahead {
+                if danger_ahead {
                     if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
                         let hx = (house.tile_x as f32 + house.w as f32 / 2.0)
                             * TILE_SIZE;
