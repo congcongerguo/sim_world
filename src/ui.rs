@@ -20,6 +20,11 @@ pub struct HoveredTile(pub Option<(usize, usize)>);
 #[derive(Resource, Default)]
 pub struct Selection(pub Option<(usize, usize)>);
 
+/// An entity (character, house, farm, etc.) selected by clicking.
+/// When set, the info panel shows ONLY this entity.
+#[derive(Resource, Default)]
+pub struct SelectedEntity(pub Option<Entity>);
+
 // ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
@@ -40,6 +45,7 @@ impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HoveredTile>();
         app.init_resource::<Selection>();
+        app.init_resource::<SelectedEntity>();
         app.add_systems(Startup, spawn_info_panel);
         app.add_systems(Update, update_hovered_tile);
         app.add_systems(Update, update_info_panel);
@@ -112,6 +118,11 @@ fn update_hovered_tile(
     camera_q: Query<(&Camera, &GlobalTransform)>,
     mut hovered: ResMut<HoveredTile>,
     mut selection: ResMut<Selection>,
+    mut selected_entity: ResMut<SelectedEntity>,
+    char_q: Query<(Entity, &Character, &Transform)>,
+    house_q: Query<(Entity, &House)>,
+    farm_q: Query<(Entity, &FarmTile)>,
+    grave_q: Query<(Entity, &GraveInfo, &Transform)>,
     mouse: Res<ButtonInput<MouseButton>>,
 ) {
     let Ok(window) = windows.get_single() else {
@@ -143,27 +154,61 @@ fn update_hovered_tile(
         return;
     }
 
-    hovered.0 = Some((tile_x as usize, tile_y as usize));
+    let pos = (tile_x as usize, tile_y as usize);
+    hovered.0 = Some(pos);
 
-    // Left click: toggle selection on this tile
+    // Left click: select entity on this tile
     if mouse.just_pressed(MouseButton::Left) {
-        let pos = (tile_x as usize, tile_y as usize);
-        if selection.0 == Some(pos) {
-            selection.0 = None; // deselect on second click
+        selection.0 = Some(pos);
+        // Collect all entities on this tile
+        let mut entities: Vec<Entity> = Vec::new();
+        for (e, _ch, tf) in char_q.iter() {
+            let px = (tf.translation.x / TILE_SIZE) as usize;
+            let py = (tf.translation.y / TILE_SIZE) as usize;
+            if px == pos.0 && py == pos.1 { entities.push(e); }
+        }
+        for (e, house) in house_q.iter() {
+            if pos.0 >= house.tile_x && pos.0 < house.tile_x + house.w
+                && pos.1 >= house.tile_y && pos.1 < house.tile_y + house.h
+            { entities.push(e); }
+        }
+        for (e, farm) in farm_q.iter() {
+            if farm.tile_x == pos.0 && farm.tile_y == pos.1 { entities.push(e); }
+        }
+        for (e, _grave, tf) in grave_q.iter() {
+            let gx = (tf.translation.x / TILE_SIZE) as usize;
+            let gy = (tf.translation.y / TILE_SIZE) as usize;
+            if gx == pos.0 && gy == pos.1 { entities.push(e); }
+        }
+
+        if !entities.is_empty() {
+            // If an entity is already selected and it's in this list, cycle to next
+            if let Some(current) = selected_entity.0 {
+                if let Some(idx) = entities.iter().position(|&e| e == current) {
+                    let next = (idx + 1) % entities.len();
+                    selected_entity.0 = Some(entities[next]);
+                } else {
+                    selected_entity.0 = Some(entities[0]);
+                }
+            } else {
+                selected_entity.0 = Some(entities[0]);
+            }
         } else {
-            selection.0 = Some(pos);
+            selected_entity.0 = None;
         }
     }
 
     // Right click: clear selection
     if mouse.just_pressed(MouseButton::Right) {
         selection.0 = None;
+        selected_entity.0 = None;
     }
 }
 
 fn update_info_panel(
     lang: Res<GameLang>,
     (hovered, selection): (Res<HoveredTile>, Res<Selection>),
+    selected_entity: Res<SelectedEntity>,
     map: Res<Map>,
     elevation: Option<Res<ElevationMap>>,
     terrain_data: Res<TerrainData>,
@@ -172,10 +217,10 @@ fn update_info_panel(
     shop_location: Res<ShopLocation>,
     death_events: Res<DeathEvents>,
     state_history: Res<StateHistory>,
-    house_q: Query<(&House, &Transform)>,
+    house_q: Query<(Entity, &House, &Transform)>,
     char_q: Query<(Entity, &Character, &Transform)>,
-    farm_q: Query<&FarmTile>,
-    grave_q: Query<(&GraveInfo, &Transform)>,
+    farm_q: Query<(Entity, &FarmTile)>,
+    grave_q: Query<(Entity, &GraveInfo, &Transform)>,
     mut texts: Query<&mut Text, With<InfoText>>,
 ) {
     let Ok(mut text) = texts.get_single_mut() else {
@@ -271,48 +316,52 @@ fn update_info_panel(
     // Check if a death happened at this tile this frame (before tombstone exists)
     let death_this_frame = death_events.tiles.contains(&(tx, ty));
 
+    let sel_entity = selected_entity.0;
+
     for (entity, ch, tf) in char_q.iter() {
         let px = (tf.translation.x / TILE_SIZE).floor() as isize;
         let py = (tf.translation.y / TILE_SIZE).floor() as isize;
-        if px >= 0 && py >= 0 && px as usize == tx && py as usize == ty {
-            // Skip characters that died this frame (ghost prevention)
-            if death_this_frame {
-                continue;
-            }
-            let role = match ch.stage {
-                LifeStage::Child => tr("Child", l),
-                LifeStage::Adult => tr("Adult", l),
-            };
-            let gender_str = match ch.gender {
-                Gender::Male => tr("Male", l),
-                Gender::Female => tr("Female", l),
-            };
-            let marital_str = match ch.marital {
-                MaritalStatus::Single => tr("Single", l),
-                MaritalStatus::Married => tr("Married", l),
-                MaritalStatus::Widowed => tr("Widowed", l),
-            };
-            let cur_state = ch.state_desc();
-            lines.push(format!("+2.0  {} {} ({})  {}:{}  [{}]",
-                gender_str, role, tr("character", l), tr("Food", l), ch.food, marital_str));
-            lines.push(format!("  State: {}", cur_state));
+        let on_tile = px >= 0 && py >= 0 && px as usize == tx && py as usize == ty;
+        let is_selected = sel_entity.map_or(false, |e| e == entity);
+        if !on_tile && !is_selected { continue; }
+        // Ghost prevention for on-tile characters
+        if on_tile && death_this_frame { continue; }
 
-            // State history (last 10 state transitions)
-            if let Some(history) = state_history.entries.get(&entity) {
-                if history.len() > 1 {
-                    lines.push(format!("  ── History (last 10) ──"));
-                    for (_i, (_t, desc)) in history.iter().rev().enumerate() {
-                        let marker = if desc == &cur_state { "● " } else { "  " };
-                        lines.push(format!("  {}{}", marker, desc));
-                    }
+        let role = match ch.stage {
+            LifeStage::Child => tr("Child", l),
+            LifeStage::Adult => tr("Adult", l),
+        };
+        let gender_str = match ch.gender {
+            Gender::Male => tr("Male", l),
+            Gender::Female => tr("Female", l),
+        };
+        let marital_str = match ch.marital {
+            MaritalStatus::Single => tr("Single", l),
+            MaritalStatus::Married => tr("Married", l),
+            MaritalStatus::Widowed => tr("Widowed", l),
+        };
+        let cur_state = ch.state_desc();
+        lines.push(format!("+2.0  {} {} ({})  {}:{}  [{}]",
+            gender_str, role, tr("character", l), tr("Food", l), ch.food, marital_str));
+        lines.push(format!("  State: {}", cur_state));
+
+        // State history (last 10 state transitions)
+        if let Some(history) = state_history.entries.get(&entity) {
+            if history.len() > 1 {
+                lines.push(format!("  ── History (last 10) ──"));
+                for (_i, (_t, desc)) in history.iter().rev().enumerate() {
+                    let marker = if desc == &cur_state { "● " } else { "  " };
+                    lines.push(format!("  {}{}", marker, desc));
                 }
             }
         }
     }
 
-    for (house, _) in house_q.iter() {
-        if tx >= house.tile_x && tx < house.tile_x + house.w
-            && ty >= house.tile_y && ty < house.tile_y + house.h
+    for (entity, house, _) in house_q.iter() {
+        let on_house = tx >= house.tile_x && tx < house.tile_x + house.w
+            && ty >= house.tile_y && ty < house.tile_y + house.h;
+        let is_selected = sel_entity.map_or(false, |e| e == entity);
+        if !on_house && !is_selected { continue; }
         {
             let adults = char_q.iter().filter(|(_, c, _)| c.house_id == house.id && c.stage == LifeStage::Adult).count();
             let children = char_q.iter().filter(|(_, c, _)| c.house_id == house.id && c.stage == LifeStage::Child).count();
@@ -325,8 +374,11 @@ fn update_info_panel(
         }
     }
 
-    for farm in farm_q.iter() {
-        if farm.tile_x == tx && farm.tile_y == ty {
+    for (entity, farm) in farm_q.iter() {
+        let on_farm = farm.tile_x == tx && farm.tile_y == ty;
+        let is_selected = sel_entity.map_or(false, |e| e == entity);
+        if !on_farm && !is_selected { continue; }
+        {
             let st = match farm.state {
                 CropState::Fallow => tr("Fallow", l),
                 CropState::Growing => tr("Growing", l),
@@ -347,10 +399,13 @@ fn update_info_panel(
         lines.push(format!("  [{}] {}", tr("Action", l), tr("Press C to trade", l)));
     }
 
-    for (info, tf) in grave_q.iter() {
+    for (entity, info, tf) in grave_q.iter() {
         let gx = (tf.translation.x / TILE_SIZE).floor() as isize;
         let gy = (tf.translation.y / TILE_SIZE).floor() as isize;
-        if gx >= 0 && gy >= 0 && gx as usize == tx && gy as usize == ty {
+        let on_grave = gx >= 0 && gy >= 0 && gx as usize == tx && gy as usize == ty;
+        let is_selected = sel_entity.map_or(false, |e| e == entity);
+        if !on_grave && !is_selected { continue; }
+        {
             lines.push(format!("+1.0  {}", tr("Tombstone", l)));
             let gstr = match info.gender {
                 Gender::Male => tr("Male", l),
