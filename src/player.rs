@@ -1510,21 +1510,27 @@ fn movement_system(
                 tf.translation.x += dir_x * speed * fixed_time.delta_secs();
                 tf.translation.y += dir_y * speed * fixed_time.delta_secs();
 
-                // Hit water/lava → go home (pathfinding will find a dry route)
+                // Hit water/lava: if near home, pick new direction; otherwise go home
                 let (wtx, wty) = current_tile(&tf);
                 if wtx < MAP_WIDTH && wty < MAP_HEIGHT {
                     if matches!(
                         map.tiles[wty * MAP_WIDTH + wtx],
                         TileType::Water | TileType::DeepWater | TileType::Lava
                     ) {
-                        if let Some(house) =
-                            houses.iter().find(|h| h.id == ch.house_id)
-                        {
-                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0)
-                                * TILE_SIZE;
-                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
-                                * TILE_SIZE;
-                            ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
+                        if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
+                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
+                            let d2 = (pos.0 - hx).powi(2) + (pos.1 - hy).powi(2);
+                            if d2 < 200.0 * 200.0 {
+                                // Near home — pick a new random direction instead
+                                let angle = rand::random::<f32>() * std::f32::consts::TAU;
+                                ch.state = AiState::Exploring {
+                                    origin_x: pos.0, origin_y: pos.1,
+                                    dir_x: angle.cos(), dir_y: angle.sin(),
+                                };
+                            } else {
+                                ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
+                            }
                         } else {
                             ch.state = AiState::Idle;
                             ch.timer = 60.0;
@@ -1537,22 +1543,13 @@ fn movement_system(
                 let look_ahead = 3;
                 let mut danger_ahead = false;
                 for step in 1..=look_ahead {
-                    let lx = (tf.translation.x + dir_x * step as f32 * TILE_SIZE)
-                        / TILE_SIZE;
-                    let ly = (tf.translation.y + dir_y * step as f32 * TILE_SIZE)
-                        / TILE_SIZE;
+                    let lx = (tf.translation.x + dir_x * step as f32 * TILE_SIZE) / TILE_SIZE;
+                    let ly = (tf.translation.y + dir_y * step as f32 * TILE_SIZE) / TILE_SIZE;
                     let lxi = lx.floor() as isize;
                     let lyi = ly.floor() as isize;
-                    if lxi >= 0
-                        && lxi < MAP_WIDTH as isize
-                        && lyi >= 0
-                        && lyi < MAP_HEIGHT as isize
-                    {
+                    if lxi >= 0 && lxi < MAP_WIDTH as isize && lyi >= 0 && lyi < MAP_HEIGHT as isize {
                         let li = lyi as usize * MAP_WIDTH + lxi as usize;
-                        if matches!(
-                            map.tiles[li],
-                            TileType::Water | TileType::DeepWater | TileType::Lava
-                        ) {
+                        if matches!(map.tiles[li], TileType::Water | TileType::DeepWater | TileType::Lava) {
                             danger_ahead = true;
                             break;
                         }
@@ -1560,11 +1557,19 @@ fn movement_system(
                 }
                 if danger_ahead {
                     if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
-                        let hx = (house.tile_x as f32 + house.w as f32 / 2.0)
-                            * TILE_SIZE;
-                        let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
-                            * TILE_SIZE;
-                        ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
+                        let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                        let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
+                        let d2 = (pos.0 - hx).powi(2) + (pos.1 - hy).powi(2);
+                        if d2 < 200.0 * 200.0 {
+                            // Near home — pick a new random direction
+                            let angle = rand::random::<f32>() * std::f32::consts::TAU;
+                            ch.state = AiState::Exploring {
+                                origin_x: pos.0, origin_y: pos.1,
+                                dir_x: angle.cos(), dir_y: angle.sin(),
+                            };
+                        } else {
+                            ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
+                        }
                     } else {
                         ch.state = AiState::Idle;
                         ch.timer = 60.0;
@@ -1821,10 +1826,10 @@ fn movement_system(
             tf.translation.z = 2.0 + elev_z * 4.0;
         }
 
-        // Record state for UI debugging (every ~1 game-day)
+        // Record state for UI debugging
         let now = fixed_time.delta_secs_f64();
         state_history.tick(entity, now);
-        let desc = ch.state_desc();
+        let desc = format!("[({},{})] {}", czx, czy, ch.state_desc());
         state_history.record(entity, now, desc);
     }
 }
