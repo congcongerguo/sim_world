@@ -149,6 +149,24 @@ pub struct Character {
     pub path_pending: bool,
 }
 
+impl Character {
+    fn state_desc(&self) -> String {
+        match &self.state {
+            AiState::Idle => format!("Idle  timer={:.1}", self.timer),
+            AiState::MoveTo { target: (wx, wy), path, cursor, purposeful, path_pending } => {
+                let p = if *purposeful { "P" } else { "" };
+                format!("MoveTo({:.0},{:.0}){} cur={}/{} pend={}", wx, wy, p, cursor, path.len(), path_pending)
+            }
+            AiState::Exploring { dir_x, dir_y, .. } => {
+                format!("Exploring dir=({:.2},{:.2})", dir_x, dir_y)
+            }
+            AiState::GoingToShop => "GoingToShop".to_string(),
+            AiState::GoingToSocial(x, y) => format!("GoingToSocial({:.0},{:.0})", x, y),
+            AiState::Socializing => format!("Socializing timer={:.1}", self.timer),
+        }
+    }
+}
+
 /// Tracks age of a child character (sim-seconds accumulated).
 #[derive(Component)]
 pub struct Growing {
@@ -197,37 +215,30 @@ impl Plugin for CharacterPlugin {
         app.init_resource::<PathMemory>();
         app.init_resource::<StarvationTimer>();
         app.init_resource::<FoodDiagTimer>();
+        app.init_resource::<StateHistory>();
         app.add_systems(PostStartup, (
             spawn_characters.after(setup_farm_layout),
             spawn_houses.after(setup_farm_layout),
             spawn_shop.after(setup_farm_layout),
         ));
         app.add_systems(FixedUpdate, (
-            // 1. 先处理上一帧积累的人物操作事件（收获、种植、交易）
             crate::actions::process_action_events,
-            // 2. 作物生长（基于稳定后的地块状态）
             crate::farmland::update_crop_growth,
-            // 3. 感知 → 决策 → 移动
-            romance_system,
-            perception_system,
+            (romance_system, perception_system).chain(),
             decision_system,
-            crate::pathfinding::process_path_requests,
-            movement_system,
-            // 4. 到达目的地后执行操作
-            action_system,
-            // 5. 人口变化
+        ));
+        app.add_systems(FixedUpdate, movement_system);
+        app.add_systems(FixedUpdate, action_system);
+        app.add_systems(FixedUpdate, crate::pathfinding::process_path_requests);
+        app.add_systems(FixedUpdate, (
             reproduction_system,
             child_growth_system,
-            // 6. 先消耗食物，再判断是否饿死
             (aging_system, daily_consumption).chain(),
-            // 7. 继承和坟墓
             inheritance_system,
             grave_system,
-            // 8. 日用品消耗
             essentials_depletion,
-            // 9. 日志
             food_diagnostics,
-        ).chain());
+        ));
         app.add_systems(Update, (
             road_render_system,
             shop_interaction,
@@ -1154,17 +1165,15 @@ fn movement_system(
     mut chars: Query<(Entity, &mut Character, &mut Transform)>,
     farm_tiles: Query<(&FarmTile, &Transform), Without<Character>>,
     houses: Query<&House>,
-    map: Res<Map>,
-    elevation: Res<ElevationMap>,
+    (map, elevation): (Res<Map>, Res<ElevationMap>),
     mut next_id: ResMut<NextSettlementId>,
     shop_location: Res<ShopLocation>,
-    mut road_wear: ResMut<RoadWear>,
-    mut path_memory: ResMut<PathMemory>,
+    (mut road_wear, mut path_memory): (ResMut<RoadWear>, ResMut<PathMemory>),
     mut pending_farmland: ResMut<PendingFarmland>,
     mut events: EventWriter<ActionEvent>,
     assets: Res<GameAssets>,
     tree_mask: Res<TreeMask>,
-    mut queue: ResMut<PathRequestQueue>,
+    (mut queue, mut state_history): (ResMut<PathRequestQueue>, ResMut<StateHistory>),
 ) {
     let road_mask: Vec<bool> =
         road_wear.wear.iter().map(|&w| w >= ROAD_THRESHOLD_1).collect();
@@ -1805,6 +1814,12 @@ fn movement_system(
             let elev_z = elevation.0[czy * MAP_WIDTH + czx] as f32;
             tf.translation.z = 2.0 + elev_z * 4.0;
         }
+
+        // Record state for UI debugging (every ~1 game-day)
+        let now = fixed_time.delta_secs_f64();
+        state_history.tick(entity, now);
+        let desc = ch.state_desc();
+        state_history.record(entity, now, desc);
     }
 }
 
@@ -2648,8 +2663,45 @@ impl Default for ShopLocation {
     }
 }
 
+/// Tracks the last 10 state transitions for each character for UI debugging.
+#[derive(Resource, Default)]
+pub struct StateHistory {
+    pub entries: std::collections::HashMap<Entity, Vec<(f64, String)>>,
+    timers: std::collections::HashMap<Entity, f64>,
+    last: std::collections::HashMap<Entity, String>,
+}
+
+impl StateHistory {
+    /// Advance the per-entity timer.
+    pub fn tick(&mut self, entity: Entity, dt: f64) {
+        *self.timers.entry(entity).or_insert(0.0) += dt;
+    }
+
+    /// Record a state entry if enough time has passed AND the state differs.
+    pub fn record(&mut self, entity: Entity, game_time: f64, desc: String) {
+        let timer = self.timers.entry(entity).or_insert(0.0);
+        if *timer < 1.0 {
+            return; // rate-limit: max 1 entry per second
+        }
+        *timer = 0.0;
+
+        let last = self.last.entry(entity).or_default();
+        if *last == desc {
+            return; // only record state changes
+        }
+        *last = desc.clone();
+
+        let entries = self.entries.entry(entity).or_default();
+        entries.push((game_time, desc));
+        if entries.len() > 10 {
+            entries.remove(0);
+        }
+    }
+}
+
 /// Per-tile foot-traffic wear counter (MAP_WIDTH × MAP_HEIGHT).
 #[derive(Resource)]
+
 pub struct RoadWear {
     pub wear: Vec<u32>,
 }

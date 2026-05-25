@@ -5,7 +5,7 @@ use crate::farmland::{CropState, FarmTile};
 use crate::generation::ElevationMap;
 use crate::lang::{tr, GameLang};
 use crate::map::{Map, TerrainData, TileCategory, TileContent, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
-use crate::player::{Character, DeathEvents, Gender, GraveInfo, House, LifeStage, MaritalStatus, ShopLocation};
+use crate::player::{Character, DeathEvents, Gender, GraveInfo, House, LifeStage, MaritalStatus, ShopLocation, StateHistory};
 use crate::sim_time::YEAR;
 use crate::sim_time::{SimTime, TimeScale};
 
@@ -41,7 +41,9 @@ impl Plugin for UIPlugin {
         app.init_resource::<HoveredTile>();
         app.init_resource::<Selection>();
         app.add_systems(Startup, spawn_info_panel);
-        app.add_systems(Update, (update_hovered_tile, update_info_panel, update_household_summary));
+        app.add_systems(Update, update_hovered_tile);
+        app.add_systems(Update, update_info_panel);
+        app.add_systems(Update, update_household_summary);
     }
 }
 
@@ -161,18 +163,17 @@ fn update_hovered_tile(
 
 fn update_info_panel(
     lang: Res<GameLang>,
-    hovered: Res<HoveredTile>,
-    selection: Res<Selection>,
+    (hovered, selection): (Res<HoveredTile>, Res<Selection>),
     map: Res<Map>,
     elevation: Option<Res<ElevationMap>>,
     terrain_data: Res<TerrainData>,
     tile_content: Res<TileContent>,
-    sim: Res<SimTime>,
-    scale: Res<TimeScale>,
+    (sim, scale): (Res<SimTime>, Res<TimeScale>),
     shop_location: Res<ShopLocation>,
     death_events: Res<DeathEvents>,
+    state_history: Res<StateHistory>,
     house_q: Query<(&House, &Transform)>,
-    char_q: Query<(&Character, &Transform)>,
+    char_q: Query<(Entity, &Character, &Transform)>,
     farm_q: Query<&FarmTile>,
     grave_q: Query<(&GraveInfo, &Transform)>,
     mut texts: Query<&mut Text, With<InfoText>>,
@@ -270,7 +271,7 @@ fn update_info_panel(
     // Check if a death happened at this tile this frame (before tombstone exists)
     let death_this_frame = death_events.tiles.contains(&(tx, ty));
 
-    for (ch, tf) in char_q.iter() {
+    for (entity, ch, tf) in char_q.iter() {
         let px = (tf.translation.x / TILE_SIZE).floor() as isize;
         let py = (tf.translation.y / TILE_SIZE).floor() as isize;
         if px >= 0 && py >= 0 && px as usize == tx && py as usize == ty {
@@ -307,6 +308,17 @@ fn update_info_panel(
                 format!("{}: {:.0}%", name, val * 100.0)
             }).collect();
             lines.push(format!("  {}", trait_strs.join("  |  ")));
+
+            // State history (last 10 state transitions)
+            if let Some(history) = state_history.entries.get(&entity) {
+                if !history.is_empty() {
+                    lines.push(format!("  ── {} ──", "State History"));
+                    for (i, (_t, desc)) in history.iter().rev().enumerate() {
+                        let marker = if i == 0 { "→ " } else { "  " };
+                        lines.push(format!("  {}{}", marker, desc));
+                    }
+                }
+            }
         }
     }
 
@@ -314,8 +326,8 @@ fn update_info_panel(
         if tx >= house.tile_x && tx < house.tile_x + house.w
             && ty >= house.tile_y && ty < house.tile_y + house.h
         {
-            let adults = char_q.iter().filter(|(c, _)| c.house_id == house.id && c.stage == LifeStage::Adult).count();
-            let children = char_q.iter().filter(|(c, _)| c.house_id == house.id && c.stage == LifeStage::Child).count();
+            let adults = char_q.iter().filter(|(_, c, _)| c.house_id == house.id && c.stage == LifeStage::Adult).count();
+            let children = char_q.iter().filter(|(_, c, _)| c.house_id == house.id && c.stage == LifeStage::Child).count();
             lines.push(format!("+1.3  {} ({}×{})  ({})",
                 tr("House", l), house.w, house.h, tr("building", l)));
             lines.push(format!("  {}: {}  {}: {}  {}: {}",
