@@ -7,6 +7,7 @@ use crate::generation::ElevationMap;
 use crate::map::{Map, TileCategory, TileContent, TileEntry, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_time::YEAR;
 use crate::vegetation::TreeMask;
+use crate::pathfinding::{PathRequest, PathRequestQueue};
 
 // ---------------------------------------------------------------------------
 // Constants — expressed in game days (1 tick ≈ 1 day)
@@ -47,8 +48,8 @@ const HOUSE_START_ESSENTIALS: u32 = 20;
 const ESSENTIALS_LOW_THRESHOLD: u32 = 5;
 
 // Road wear
-const ROAD_THRESHOLD_1: u32 = 4;
-const ROAD_THRESHOLD_3: u32 = 30;
+pub(crate) const ROAD_THRESHOLD_1: u32 = 4;
+pub(crate) const ROAD_THRESHOLD_3: u32 = 30;
 
 // ---------------------------------------------------------------------------
 // Components
@@ -65,10 +66,10 @@ pub enum Percept {
     TreesNearby { count: usize, center_tx: usize, center_ty: usize },
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum AiState {
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum AiState {
     Idle,
-    MoveTo(f32, f32, bool), // x, y, purposeful (creates road wear)
+    MoveTo { target: (f32, f32), path: Vec<(usize, usize)>, cursor: usize, purposeful: bool, path_pending: bool },
     Exploring { origin_x: f32, origin_y: f32, dir_x: f32, dir_y: f32 },
     GoingToShop,
     GoingToSocial(f32, f32),
@@ -119,10 +120,10 @@ pub enum MaritalStatus {
 #[derive(Component)]
 pub struct Character {
     pub speed: f32,
-    state: AiState,
-    timer: f64,
+    pub(crate) state: AiState,
+    pub(crate) timer: f64,
     /// Flag raised when the character arrives at a farm tile.
-    action_tile: Option<(usize, usize)>,
+    pub(crate) action_tile: Option<(usize, usize)>,
     /// Which plot (settlement) this character manages.
     pub plot_id: usize,
     /// Which house (by House::id) this character lives in.
@@ -140,12 +141,12 @@ pub struct Character {
     pub food: u32,
     /// Perceived entities within sight range, refreshed every tick.
     pub percepts: Vec<Percept>,
-    /// Seconds spent on very slow terrain (<10% speed). Resets on fast terrain.
-    stuck_timer: f64,
-    /// Consecutive frames spent in water. Reset on land. When > threshold,
-    /// the SWIM handler assumes the destination is unreachable, blacklists
-    /// it, and forces the character into Exploring state.
-    swim_streak: u32,
+    /// Path following state for GoingToShop / GoingToSocial (not MoveTo
+    /// which stores the path directly in AiState::MoveTo).
+    pub pending_path: Vec<(usize, usize)>,
+    pub path_cursor: usize,
+    /// Tracks whether a pathfinding request has been submitted for GoingToShop/GoingToSocial.
+    pub path_pending: bool,
 }
 
 /// Tracks age of a child character (sim-seconds accumulated).
@@ -210,6 +211,7 @@ impl Plugin for CharacterPlugin {
             romance_system,
             perception_system,
             decision_system,
+            crate::pathfinding::process_path_requests,
             movement_system,
             // 4. 到达目的地后执行操作
             action_system,
@@ -280,33 +282,6 @@ fn nearest_shore(
 /// Find the nearest tile with decent movement speed (>0.15 equivalent) within
 /// a scan radius.  Used when a character gets stuck on very slow terrain so
 /// they can escape to a walkable tile without teleporting.
-fn nearest_passable(
-    tx: usize, ty: usize, map: &Map, max_radius: usize,
-) -> Option<(usize, usize)> {
-    for r in 1..=max_radius {
-        for dy in -(r as isize)..=r as isize {
-            for dx in -(r as isize)..=r as isize {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let nx = tx as isize + dx;
-                let ny = ty as isize + dy;
-                if nx >= 0 && nx < MAP_WIDTH as isize && ny >= 0 && ny < MAP_HEIGHT as isize {
-                    let tile = map.tiles[ny as usize * MAP_WIDTH + nx as usize];
-                    if !matches!(
-                        tile,
-                        TileType::Water | TileType::DeepWater | TileType::Lava
-                            | TileType::Stone | TileType::Snow | TileType::Swamp | TileType::Ice
-                    ) {
-                        return Some((nx as usize, ny as usize));
-                    }
-                }
-            }
-        }
-    }
-    // Fallback: any non-water tile (including Stone/Snow etc.) if nothing better
-    nearest_shore(tx, ty, map, max_radius)
-}
 
 /// Speed multiplier based on terrain type, road wear, elevation, and local steepness.
 /// Roads (well-trodden tiles) give significant speed bonus.
@@ -475,7 +450,7 @@ fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>, assets: Res
                     timer: offset_x as f64,
                     action_tile: None,
                     percepts: Vec::new(),
-                    stuck_timer: 0.0,
+                    pending_path: Vec::new(),
                     plot_id: i,
                     house_id: i,
                     stage: LifeStage::Adult,
@@ -485,7 +460,8 @@ fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>, assets: Res
                     marital: if offset_x < 2 { MaritalStatus::Married } else { MaritalStatus::Single },
                     sight_range: 8.0,
                     food: 10,
-                    swim_streak: 0,
+                    path_cursor: 0,
+                                    path_pending: false,
                 },
                 Transform::from_xyz(x, y, 2.0),
                 GlobalTransform::default(),
@@ -514,7 +490,7 @@ fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>, assets: Res
                     timer: rand::random::<f64>() * 3.0,
                     action_tile: None,
                     percepts: Vec::new(),
-                    stuck_timer: 0.0,
+                    pending_path: Vec::new(),
                     plot_id: i,
                     house_id: i,
                     stage: LifeStage::Child,
@@ -524,7 +500,8 @@ fn spawn_characters(mut commands: Commands, layout: Res<FarmLayout>, assets: Res
                     marital: MaritalStatus::Single,
                     sight_range: 4.0,
                     food: 10,
-                    swim_streak: 0,
+                    path_cursor: 0,
+                                    path_pending: false,
                 },
                 Growing { age: child_age },
                 Transform::from_xyz(cx + ox, cy + oy, 2.0),
@@ -686,102 +663,6 @@ fn spawn_shop(
 
 /// Compute a direction vector biased toward known paths and easier terrain.
 /// Farm tiles are avoided unless the character is heading to one for farm work.
-fn biased_dir(
-    from: (f32, f32),
-    to: (f32, f32),
-    map: &Map,
-    path_memory: &PathMemory,
-    elevation: &[f64],
-    sight_range: f32,
-) -> (f32, f32) {
-    let dx = to.0 - from.0;
-    let dy = to.1 - from.1;
-    let dist = (dx * dx + dy * dy).sqrt();
-    if dist < 2.0 {
-        return (0.0, 0.0);
-    }
-    let mut dir_x = dx / dist;
-    let mut dir_y = dy / dist;
-
-    let (ctx, cty) = (
-        (from.0 / TILE_SIZE) as isize,
-        (from.1 / TILE_SIZE) as isize,
-    );
-    let mut nudge_x = 0.0f32;
-    let mut nudge_y = 0.0f32;
-
-    let sight = (sight_range as isize).max(1).min(10);
-    for ddy in -sight..=sight {
-        for ddx in -sight..=sight {
-            if ddx == 0 && ddy == 0 { continue; }
-            let tx = ctx + ddx;
-            let ty = cty + ddy;
-            if tx < 0 || tx >= MAP_WIDTH as isize || ty < 0 || ty >= MAP_HEIGHT as isize {
-                continue;
-            }
-            let (tux, tuy) = (tx as usize, ty as usize);
-
-            // Distance weight: closer tiles influence more
-            let tile_dist = ((ddx * ddx + ddy * ddy) as f32).sqrt();
-            let dist_weight = (1.0 / (tile_dist + 1.0)).max(0.05);
-
-            // Direction alignment: tiles in the travel direction get bonus
-            let align = if tile_dist > 0.01 {
-                (ddx as f32 / tile_dist * dir_x + ddy as f32 / tile_dist * dir_y).max(0.0)
-            } else {
-                0.0
-            };
-            let combined_weight = dist_weight * (0.4 + align * 0.6);
-
-            let terrain_speed = match map.tiles[tuy * MAP_WIDTH + tux] {
-                TileType::Water | TileType::DeepWater | TileType::Lava => {
-                    let rep = if tile_dist <= 3.0 { 10.0 } else { 2.0 };
-                    nudge_x -= (tx - ctx) as f32 * rep * combined_weight;
-                    nudge_y -= (ty - cty) as f32 * rep * combined_weight;
-                    continue;
-                }
-                TileType::Grass | TileType::Meadow | TileType::Dirt => 1.0,
-                TileType::Sand | TileType::Clay => 0.7,
-                TileType::Desert => 0.5,
-                TileType::Tundra => 0.25,
-                TileType::Forest => 0.20,
-                TileType::Ice => 0.20,
-                TileType::Snow => 0.20,
-                TileType::Swamp => 0.15,
-                TileType::Stone => 0.20,
-            };
-            let mem = path_memory.counts[tuy * MAP_WIDTH + tux] as f32;
-            let tile_elev = elevation[tuy * MAP_WIDTH + tux] as f32;
-            // Elevation penalty: prefer valleys (up to 75% penalty)
-            let elev_penalty = 1.0 - (tile_elev - 0.5).max(0.0) * 1.5;
-            // Steepness penalty: avoid steep slopes
-            let mut steep_penalty = 1.0f32;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    if dx == 0 && dy == 0 { continue; }
-                    let nx = tux as isize + dx;
-                    let ny = tuy as isize + dy;
-                    if nx >= 0 && nx < MAP_WIDTH as isize && ny >= 0 && ny < MAP_HEIGHT as isize {
-                        let diff = (tile_elev - elevation[ny as usize * MAP_WIDTH + nx as usize] as f32).abs();
-                        if diff * 6.0 > (1.0 - steep_penalty) { steep_penalty = 1.0 - diff * 6.0; }
-                    }
-                }
-            }
-            let weight = terrain_speed * (1.0 + (mem as f32).sqrt() * 2.0) * elev_penalty * steep_penalty * combined_weight;
-            nudge_x += (tx - ctx) as f32 * weight;
-            nudge_y += (ty - cty) as f32 * weight;
-        }
-    }
-
-    dir_x += nudge_x * 0.008;
-    dir_y += nudge_y * 0.008;
-    let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
-    if len > 0.01 {
-        (dir_x / len, dir_y / len)
-    } else {
-        (dx / dist, dy / dist)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Perception — each character scans their sight range for interesting entities
@@ -944,20 +825,6 @@ fn perception_system(
 
 /// Returns true if a tile has 2+ water/ deep-water cardinal neighbours,
 /// which makes it unreachable via biased_dir pathfinding (coastal tile).
-fn is_coastal_tile(tx: usize, ty: usize, map: &Map) -> bool {
-    let mut wc = 0i32;
-    for (dx, dy) in &[(0isize, -1isize), (1, 0), (0, 1), (-1, 0)] {
-        let nx = tx as isize + dx;
-        let ny = ty as isize + dy;
-        if nx >= 0 && nx < MAP_WIDTH as isize && ny >= 0 && ny < MAP_HEIGHT as isize {
-            match map.tiles[ny as usize * MAP_WIDTH + nx as usize] {
-                TileType::Water | TileType::DeepWater => wc += 1,
-                _ => {}
-            }
-        }
-    }
-    wc >= 2
-}
 
 fn decision_system(
     mut chars: Query<(&mut Character, &Transform)>,
@@ -965,8 +832,8 @@ fn decision_system(
     _graves: Query<&GraveInfo>,
     shop_location: Res<ShopLocation>,
     pending_farmland: Res<PendingFarmland>,
-    map: Res<Map>,
-    road_wear: Res<RoadWear>,
+    _map: Res<Map>,
+    _road_wear: Res<RoadWear>,
 ) {
     let (adult_counts, oldest_two): (
         std::collections::HashMap<usize, usize>,
@@ -1010,7 +877,7 @@ fn decision_system(
                 let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
                 let wx = hx + (rand::random::<f32>() - 0.5) * 200.0;
                 let wy = hy + (rand::random::<f32>() - 0.5) * 200.0;
-                ch.state = AiState::MoveTo(wx, wy, false);
+                ch.state = AiState::MoveTo { target: (wx, wy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
             }
             ch.timer = 2.0;
             continue;
@@ -1042,7 +909,7 @@ fn decision_system(
                     let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
                     let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
                     if dist_to(pos, (hx, hy)) > HOME_FOOD_RANGE {
-                        ch.state = AiState::MoveTo(hx, hy, true);
+                        ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: true, path_pending: false };
                         ch.timer = 10.0;
                         continue;
                     }
@@ -1094,16 +961,6 @@ fn decision_system(
                     .filter(|p| {
                         matches!(p, Percept::FarmTile { state, growth, .. }
                             if *state == wanted && (wanted != CropState::Ready || *growth >= MIN_READY_TIME))
-                    })
-                    .filter(|p| {
-                        // Skip coastal tiles (2+ water neighbours) that biased_dir can't reach
-                        !matches!(p, Percept::FarmTile { tile_x, tile_y, .. }
-                            if is_coastal_tile(*tile_x, *tile_y, &map))
-                    })
-                    .filter(|p| {
-                        // Skip recently failed destinations (blacklisted via RoadWear)
-                        !matches!(p, Percept::FarmTile { tile_x, tile_y, .. }
-                            if road_wear.is_failed(*tile_x, *tile_y))
                     })
                     .collect();
                 if candidates.is_empty() {
@@ -1181,7 +1038,7 @@ fn decision_system(
                     pending_farmland
                         .plots
                         .get(&ch.plot_id)
-                        .and_then(|tiles| tiles.iter().copied().find(|(tx, ty)| !is_coastal_tile(*tx, *ty, &map)))
+                        .and_then(|tiles| tiles.iter().copied().next())
                 } else {
                     None
                 }
@@ -1192,12 +1049,12 @@ fn decision_system(
                 pending_farmland
                     .plots
                     .get(&ch.plot_id)
-                    .and_then(|tiles| tiles.iter().copied().find(|(tx, ty)| !is_coastal_tile(*tx, *ty, &map)))
+                    .and_then(|tiles| tiles.iter().copied().next())
             });
 
         if let Some((tx, ty)) = target {
             let (wx, wy) = tile_center(tx, ty);
-            ch.state = AiState::MoveTo(wx, wy, true);
+            ch.state = AiState::MoveTo { target: (wx, wy), path: Vec::new(), cursor: 0, purposeful: true, path_pending: false };
             ch.timer = 10.0;
             continue;
         }
@@ -1276,7 +1133,7 @@ fn decision_system(
                 let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
                 // Only go home if not already there — prevents no-op MoveTo loop
                 if dist_to(pos, (hx, hy)) > TILE_SIZE {
-                    ch.state = AiState::MoveTo(hx, hy, true);
+                    ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: true, path_pending: false };
                     ch.timer = 5.0;
                 } else {
                     ch.state = AiState::Idle;
@@ -1294,7 +1151,7 @@ fn decision_system(
 fn movement_system(
     fixed_time: Res<Time<Fixed>>,
     mut commands: Commands,
-    mut chars: Query<(&mut Character, &mut Transform)>,
+    mut chars: Query<(Entity, &mut Character, &mut Transform)>,
     farm_tiles: Query<(&FarmTile, &Transform), Without<Character>>,
     houses: Query<&House>,
     map: Res<Map>,
@@ -1307,12 +1164,8 @@ fn movement_system(
     mut events: EventWriter<ActionEvent>,
     assets: Res<GameAssets>,
     tree_mask: Res<TreeMask>,
+    mut queue: ResMut<PathRequestQueue>,
 ) {
-    let farm_set: std::collections::HashSet<(usize, usize)> = farm_tiles
-        .iter()
-        .map(|(ft, _)| (ft.tile_x, ft.tile_y))
-        .collect();
-
     let road_mask: Vec<bool> =
         road_wear.wear.iter().map(|&w| w >= ROAD_THRESHOLD_1).collect();
 
@@ -1332,48 +1185,23 @@ fn movement_system(
         list
     };
 
-    for (mut ch, mut tf) in chars.iter_mut() {
+    for (entity, mut ch, mut tf) in chars.iter_mut() {
         let dt = fixed_time.delta_secs_f64();
         ch.timer -= dt;
         let pos = (tf.translation.x, tf.translation.y);
 
-        // Water → swim to nearest shore.
-        // Does NOT change ch.state — preserves the original destination so the
-        // timeout handler (timer < -15.0) can blacklist it if the tile is
-        // unreachable across water.  Movement is applied inline.
+        // If character is on a water/lava tile, path to the nearest passable
+        // tile instead of swimming.  With HPA* water is impassable so this
+        // only triggers for characters that ended up here (save load, etc.).
         let (wcx, wcy) = current_tile(&tf);
         if wcx < MAP_WIDTH && wcy < MAP_HEIGHT {
             if matches!(
                 map.tiles[wcy * MAP_WIDTH + wcx],
                 TileType::Water | TileType::DeepWater | TileType::Lava
             ) {
-                ch.swim_streak += 1;
-
-                // Safety valve: after 60 s of consecutive swimming, the
-                // destination is unreachable.  Blacklist it and go explore.
-                if ch.swim_streak > 1200 {
-                    if let AiState::MoveTo(wx, wy, _) = ch.state {
-                        let (dtx, dty) = ((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize);
-                        road_wear.mark_failed(dtx, dty);
-                        info!(
-                            "[SWIM] #{} blacklisting ({},{}) after swim loop",
-                            ch.house_id, dtx, dty,
-                        );
-                    }
-                    let angle = rand::random::<f32>() * std::f32::consts::TAU;
-                    ch.state = AiState::Exploring {
-                        origin_x: pos.0, origin_y: pos.1,
-                        dir_x: angle.cos(), dir_y: angle.sin(),
-                    };
-                    ch.timer = 15.0;
-                    ch.swim_streak = 0;
-                } else if let Some(shore) = nearest_shore(wcx, wcy, &map, 20) {
-                    let (swx, swy) = tile_center(shore.0, shore.1);
-                    warn!(
-                        "[SWIM] #{} swim ({},{}) → shore ({},{})  streak={}",
-                        ch.house_id, wcx, wcy, shore.0, shore.1, ch.swim_streak,
-                    );
-                    // Move toward shore without changing state or resetting timer
+                // Find nearest passable tile and go there
+                if let Some((sx, sy)) = nearest_shore(wcx, wcy, &map, 20) {
+                    let (swx, swy) = tile_center(sx, sy);
                     let dx = swx - tf.translation.x;
                     let dy = swy - tf.translation.y;
                     let dist = (dx * dx + dy * dy).sqrt();
@@ -1384,7 +1212,6 @@ fn movement_system(
                         tf.translation.x += (dx / dist) * spd;
                         tf.translation.y += (dy / dist) * spd;
                     } else {
-                        // Close enough — snap to shore
                         tf.translation.x = swx;
                         tf.translation.y = swy;
                     }
@@ -1393,264 +1220,250 @@ fn movement_system(
             }
         }
 
-        // Reset swim streak on dry land
-        ch.swim_streak = 0;
-
-        // Terrain stuck — react based on state when stuck for >10 s.
-        let terrain_spd = tile_speed_multiplier(&map, &tf, &road_wear.wear, &elevation.0);
-        if terrain_spd < 0.25 {
-            ch.stuck_timer += dt;
-            if ch.stuck_timer > 10.0 {
-                match ch.state {
-                    // MoveTo stuck → blacklist destination, escape to passable terrain
-                    AiState::MoveTo(wx, wy, _) => {
-                        let (dtx, dty) = ((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize);
-                        road_wear.mark_failed(dtx, dty);
-                        let (tx, ty) = current_tile(&tf);
-                        if let Some((ex, ey)) = nearest_passable(tx, ty, &map, 15) {
-                            let (ewx, ewy) = tile_center(ex, ey);
-                            ch.state = AiState::MoveTo(ewx, ewy, false);
-                            ch.stuck_timer = -10.0;
-                            info!(
-                                "[STUCK] #{} MoveTo blocked ({},{}) → passable ({},{})",
-                                ch.house_id, tx, ty, ex, ey,
-                            );
-                        } else if let Some(h) = houses.iter().find(|hh| hh.id == ch.house_id) {
-                            let hx = (h.tile_x as f32 + h.w as f32 / 2.0) * TILE_SIZE;
-                            let hy = (h.tile_y as f32 + h.h as f32 / 2.0) * TILE_SIZE;
-                            ch.state = AiState::MoveTo(hx, hy, false);
-                            ch.stuck_timer = -10.0;
-                        }
-                    }
-                    // Explorer stuck → steer downhill (lowest-elevation direction)
-                    AiState::Exploring { .. } => {
-                        let (tx, ty) = current_tile(&tf);
-                        let mut best_dir = (0.0f32, 0.0f32);
-                        let mut best_elev = f64::MAX;
-                        for dy in -3..=3isize {
-                            for dx in -3..=3isize {
-                                if dx == 0 && dy == 0 { continue; }
-                                let nx = tx as isize + dx;
-                                let ny = ty as isize + dy;
-                                if nx >= 0 && nx < MAP_WIDTH as isize
-                                    && ny >= 0 && ny < MAP_HEIGHT as isize
-                                {
-                                    let e = elevation.0[ny as usize * MAP_WIDTH + nx as usize];
-                                    if e < best_elev {
-                                        best_elev = e;
-                                        best_dir = (dx as f32, dy as f32);
-                                    }
-                                }
-                            }
-                        }
-                        let len = (best_dir.0.powi(2) + best_dir.1.powi(2)).sqrt().max(0.001);
-                        ch.state = AiState::Exploring {
-                            origin_x: pos.0, origin_y: pos.1,
-                            dir_x: best_dir.0 / len, dir_y: best_dir.1 / len,
-                        };
-                        info!(
-                            "[STUCK] #{} explorer re-routed downhill from ({},{})",
-                            ch.house_id, tx, ty,
-                        );
-                        ch.stuck_timer = -10.0;
-                    }
-                    // Idle / social / shop → escape to nearest passable tile
-                    _ => {
-                        let (tx, ty) = current_tile(&tf);
-                        if let Some((ex, ey)) = nearest_passable(tx, ty, &map, 15) {
-                            let (ewx, ewy) = tile_center(ex, ey);
-                            ch.state = AiState::MoveTo(ewx, ewy, false);
-                            ch.stuck_timer = -10.0;
-                            info!(
-                                "[STUCK] #{} escaping ({},{}) → passable ({},{})",
-                                ch.house_id, tx, ty, ex, ey,
-                            );
-                        } else if let Some(h) = houses.iter().find(|hh| hh.id == ch.house_id) {
-                            let hx = (h.tile_x as f32 + h.w as f32 / 2.0) * TILE_SIZE;
-                            let hy = (h.tile_y as f32 + h.h as f32 / 2.0) * TILE_SIZE;
-                            ch.state = AiState::MoveTo(hx, hy, false);
-                            ch.stuck_timer = -10.0;
-                        }
-                    }
-                }
-            }
-        } else {
-            ch.stuck_timer = 0.0;
-        }
-
         // Skip state machine if waiting for action processing
-        // (water check and stuck check still run above)
         if ch.action_tile.is_some() {
             continue;
         }
 
-        // MoveTo timeout: if character has been walking for >15 game-days
-        // without arriving, give up and blacklist the destination.
-        // This prevents biased_dir from trapping the character in oscillation
-        // near difficult terrain or repeatedly targeting unreachable coastal tiles.
-        if ch.timer < -15.0 {
-            // Blacklist the destination tile so decision_system won't retry it
-            if let AiState::MoveTo(wx, wy, _) = ch.state {
-                let (dtx, dty) = ((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize);
-                road_wear.mark_failed(dtx, dty);
-            }
-            if matches!(ch.state, AiState::MoveTo(..) | AiState::GoingToShop | AiState::GoingToSocial(..)) {
-                info!(
-                    "[TIMEOUT] House #{} giving up on {:?} (timer={:.1})",
-                    ch.house_id, ch.state, ch.timer,
-                );
-                // Set to exploring so character moves to a new position,
-                // getting out of the terrain that was blocking them.
-                // After exploring, decision_system will re-evaluate.
-                let angle = rand::random::<f32>() * std::f32::consts::TAU;
-                ch.state = AiState::Exploring {
-                    origin_x: pos.0, origin_y: pos.1,
-                    dir_x: angle.cos(), dir_y: angle.sin(),
-                };
-                ch.timer = 10.0;
-            }
-        }
-
+        let speed_val = ch.speed;
         match ch.state {
             AiState::Idle => {
                 // handled by decision_system
             }
 
-            AiState::MoveTo(wx, wy, purposeful) => {
-                let dx = wx - pos.0;
-                let dy = wy - pos.1;
-                let dist = (dx * dx + dy * dy).sqrt();
+            AiState::MoveTo { target: (wx, wy), ref mut path, ref mut cursor, purposeful, ref mut path_pending } => {
+                // If path not yet requested, submit a request
+                if path.is_empty() && !*path_pending {
+                    // If already at the target tile, handle arrival immediately
+                    let dx = wx - pos.0;
+                    let dy = wy - pos.1;
+                    if dx * dx + dy * dy < 4.0 {
+                        tf.translation.x = wx;
+                        tf.translation.y = wy;
+                        let (tx, ty) = current_tile(&tf);
+                        let is_my_farm = farm_tiles.iter().any(|(ft, _)| {
+                            ft.tile_x == tx && ft.tile_y == ty && ft.plot == ch.plot_id
+                        });
+                        let is_pending = pending_farmland
+                            .plots.get(&ch.plot_id)
+                            .map(|tiles| tiles.contains(&(tx, ty)))
+                            .unwrap_or(false);
+                        if is_my_farm || is_pending {
+                            ch.action_tile = Some((tx, ty));
+                        } else {
+                            ch.state = AiState::Idle;
+                            ch.timer = 3.0;
+                        }
+                        continue;
+                    }
+                    let src = current_tile(&tf);
+                    let dst_tile = ((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize);
+                    queue.requests.push(PathRequest {
+                        entity,
+                        src_tile: src,
+                        dst_tile: dst_tile,
+                        world_target: (wx, wy),
+                        purposeful,
+                    });
+                    *path_pending = true;
+                    continue;
+                }
+                // If path is still empty (shouldn't happen — process_path_requests
+                // sets Idle on failure), skip this frame
+                if path.is_empty() {
+                    continue;
+                }
 
                 let tile_speed =
                     tile_speed_multiplier(&map, &tf, &road_wear.wear, &elevation.0);
-                let step = ch.speed * tile_speed * fixed_time.delta_secs();
+                let step = speed_val * tile_speed * fixed_time.delta_secs();
 
-                if dist < 2.0 || dist <= step {
-                    tf.translation.x = wx;
-                    tf.translation.y = wy;
+                if *cursor >= path.len() {
+                    // End of path — check if close enough to target
+                    let dx = wx - pos.0;
+                    let dy = wy - pos.1;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < 2.0 || dist <= step {
+                        tf.translation.x = wx;
+                        tf.translation.y = wy;
 
-                    let (tx, ty) = current_tile(&tf);
-                    let is_my_farm = farm_tiles.iter().any(|(ft, _)| {
-                        ft.tile_x == tx && ft.tile_y == ty && ft.plot == ch.plot_id
-                    });
-                    let is_pending = pending_farmland
-                        .plots
-                        .get(&ch.plot_id)
-                        .map(|tiles| tiles.contains(&(tx, ty)))
-                        .unwrap_or(false);
-                    if is_my_farm || is_pending {
-                        ch.action_tile = Some((tx, ty));
+                        let (tx, ty) = current_tile(&tf);
+                        let is_my_farm = farm_tiles.iter().any(|(ft, _)| {
+                            ft.tile_x == tx && ft.tile_y == ty && ft.plot == ch.plot_id
+                        });
+                        let is_pending = pending_farmland
+                            .plots
+                            .get(&ch.plot_id)
+                            .map(|tiles| tiles.contains(&(tx, ty)))
+                            .unwrap_or(false);
+                        if is_my_farm || is_pending {
+                            ch.action_tile = Some((tx, ty));
+                        } else {
+                            ch.state = AiState::Idle;
+                            ch.timer = 3.0;
+                        }
                     } else {
-                        ch.state = AiState::Idle;
-                        // Longer rest if we just escaped from bad terrain
-                        ch.timer = if ch.stuck_timer < 0.0 { 60.0 } else { 3.0 };
-                        ch.stuck_timer = 0.0;
+                        // Last mile: move directly to target
+                        let len = dist.max(0.001);
+                        tf.translation.x += (dx / len) * step;
+                        tf.translation.y += (dy / len) * step;
                     }
                 } else {
-                    let dest_tile_x = (wx / TILE_SIZE) as usize;
-                    let dest_tile_y = (wy / TILE_SIZE) as usize;
-                    let dest_is_farm = farm_set.contains(&(dest_tile_x, dest_tile_y));
+                    // Move toward next path waypoint
+                    let (next_tx, next_ty) = path[*cursor];
+                    let target_wx = next_tx as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                    let target_wy = next_ty as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                    let dx = target_wx - tf.translation.x;
+                    let dy = target_wy - tf.translation.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
 
-                    let (bdx, bdy) = if dest_is_farm || tile_speed < 0.15 {
-                        let len = (dx * dx + dy * dy).sqrt().max(0.001);
-                        (dx / len, dy / len)
-                    } else {
-                        biased_dir(
-                            (pos.0, pos.1),
-                            (wx, wy),
-                            &map,
-                            &path_memory,
-                            &elevation.0,
-                            ch.sight_range,
-                        )
-                    };
-                    tf.translation.x += bdx * step;
-                    tf.translation.y += bdy * step;
-
-                    if purposeful {
-                        let (rtx, rty) = current_tile(&tf);
-                        if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
-                            road_wear.wear[rty * MAP_WIDTH + rtx] += 2;
-                            path_memory.counts[rty * MAP_WIDTH + rtx] += 1;
+                    if dist < 2.0 || dist <= step {
+                        *cursor += 1;
+                        // Record road wear & path memory on the tile just reached
+                        if purposeful {
+                            let (rtx, rty) = current_tile(&tf);
+                            if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
+                                road_wear.wear[rty * MAP_WIDTH + rtx] += 2;
+                                path_memory.counts[rty * MAP_WIDTH + rtx] += 1;
+                            }
                         }
+                    } else {
+                        let len = dist.max(0.001);
+                        tf.translation.x += (dx / len) * step;
+                        tf.translation.y += (dy / len) * step;
                     }
                 }
             }
 
             AiState::GoingToShop => {
-                let shop_tile_x = shop_location.tile_x;
-                let shop_tile_y = shop_location.tile_y;
-                let shop_wx =
-                    shop_tile_x as f32 * TILE_SIZE + TILE_SIZE / 2.0;
-                let shop_wy =
-                    shop_tile_y as f32 * TILE_SIZE + TILE_SIZE / 2.0;
-                let dx = shop_wx - pos.0;
-                let dy = shop_wy - pos.1;
-                let dist = (dx * dx + dy * dy).sqrt();
+                if ch.pending_path.is_empty() && !ch.path_pending {
+                    let src = current_tile(&tf);
+                    let dst_tile = (shop_location.tile_x, shop_location.tile_y);
+                    // If already at the shop, act immediately
+                    if src == dst_tile {
+                        ch.action_tile = Some(dst_tile);
+                        continue;
+                    }
+                    queue.requests.push(PathRequest {
+                        entity,
+                        src_tile: src,
+                        dst_tile: dst_tile,
+                        world_target: (
+                            shop_location.tile_x as f32 * TILE_SIZE + TILE_SIZE / 2.0,
+                            shop_location.tile_y as f32 * TILE_SIZE + TILE_SIZE / 2.0,
+                        ),
+                        purposeful: true,
+                    });
+                    ch.path_pending = true;
+                    continue;
+                }
+                if ch.pending_path.is_empty() {
+                    continue;
+                }
 
+                let shop_wx = shop_location.tile_x as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                let shop_wy = shop_location.tile_y as f32 * TILE_SIZE + TILE_SIZE / 2.0;
                 let tile_speed =
                     tile_speed_multiplier(&map, &tf, &road_wear.wear, &elevation.0);
-                let step = ch.speed * tile_speed * fixed_time.delta_secs();
+                let step = speed_val * tile_speed * fixed_time.delta_secs();
 
-                if dist < 2.0 || dist <= step {
-                    tf.translation.x = shop_wx;
-                    tf.translation.y = shop_wy;
-                    ch.action_tile = Some((shop_tile_x, shop_tile_y));
-                } else {
-                    let (bdx, bdy) = if tile_speed < 0.15 {
-                        // Raw direction on slow terrain (avoid biased_dir cancel-out)
-                        let len = (dx * dx + dy * dy).sqrt().max(0.001);
-                        (dx / len, dy / len)
+                if ch.path_cursor >= ch.pending_path.len() {
+                    let dx = shop_wx - pos.0;
+                    let dy = shop_wy - pos.1;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < 2.0 || dist <= step {
+                        tf.translation.x = shop_wx;
+                        tf.translation.y = shop_wy;
+                        ch.action_tile = Some((shop_location.tile_x, shop_location.tile_y));
+                        ch.path_pending = false;
                     } else {
-                        biased_dir(
-                            (pos.0, pos.1),
-                            (shop_wx, shop_wy),
-                            &map,
-                            &path_memory,
-                            &elevation.0,
-                            ch.sight_range,
-                        )
-                    };
-                    tf.translation.x += bdx * step;
-                    tf.translation.y += bdy * step;
-
-                    let (rtx, rty) = current_tile(&tf);
-                    if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
-                        road_wear.wear[rty * MAP_WIDTH + rtx] += 2;
-                        path_memory.counts[rty * MAP_WIDTH + rtx] += 1;
+                        let len = dist.max(0.001);
+                        tf.translation.x += (dx / len) * step;
+                        tf.translation.y += (dy / len) * step;
+                    }
+                } else {
+                    let (next_tx, next_ty) = ch.pending_path[ch.path_cursor];
+                    let twx = next_tx as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                    let twy = next_ty as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                    let dx = twx - tf.translation.x;
+                    let dy = twy - tf.translation.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < 2.0 || dist <= step {
+                        ch.path_cursor += 1;
+                        let (rtx, rty) = current_tile(&tf);
+                        if rtx < MAP_WIDTH && rty < MAP_HEIGHT {
+                            road_wear.wear[rty * MAP_WIDTH + rtx] += 2;
+                            path_memory.counts[rty * MAP_WIDTH + rtx] += 1;
+                        }
+                    } else {
+                        let len = dist.max(0.001);
+                        tf.translation.x += (dx / len) * step;
+                        tf.translation.y += (dy / len) * step;
                     }
                 }
             }
 
             AiState::GoingToSocial(wx, wy) => {
-                let dx = wx - pos.0;
-                let dy = wy - pos.1;
-                let dist = (dx * dx + dy * dy).sqrt();
+                if ch.pending_path.is_empty() && !ch.path_pending {
+                    let dx = wx - pos.0;
+                    let dy = wy - pos.1;
+                    // If already at the target, transition immediately
+                    if dx * dx + dy * dy < 4.0 {
+                        tf.translation.x = wx;
+                        tf.translation.y = wy;
+                        ch.state = AiState::Socializing;
+                        ch.timer = 8.0 + rand::random::<f64>() * 8.0;
+                        continue;
+                    }
+                    let src = current_tile(&tf);
+                    let dst_tile = ((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize);
+                    queue.requests.push(PathRequest {
+                        entity,
+                        src_tile: src,
+                        dst_tile: dst_tile,
+                        world_target: (wx, wy),
+                        purposeful: false,
+                    });
+                    ch.path_pending = true;
+                    continue;
+                }
+                if ch.pending_path.is_empty() {
+                    continue;
+                }
+
                 let tile_speed =
                     tile_speed_multiplier(&map, &tf, &road_wear.wear, &elevation.0);
-                let step = ch.speed * tile_speed * fixed_time.delta_secs();
-                if dist < 2.0 || dist <= step {
-                    tf.translation.x = wx;
-                    tf.translation.y = wy;
-                    ch.state = AiState::Socializing;
-                    ch.timer = 8.0 + rand::random::<f64>() * 8.0;
-                } else {
-                    let (bdx, bdy) = if tile_speed < 0.15 {
-                        // Raw direction on slow terrain
-                        let len = (dx * dx + dy * dy).sqrt().max(0.001);
-                        (dx / len, dy / len)
+                let step = speed_val * tile_speed * fixed_time.delta_secs();
+
+                if ch.path_cursor >= ch.pending_path.len() {
+                    let dx = wx - pos.0;
+                    let dy = wy - pos.1;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < 2.0 || dist <= step {
+                        tf.translation.x = wx;
+                        tf.translation.y = wy;
+                        ch.state = AiState::Socializing;
+                        ch.timer = 8.0 + rand::random::<f64>() * 8.0;
+                        ch.path_pending = false;
                     } else {
-                        biased_dir(
-                            (pos.0, pos.1),
-                            (wx, wy),
-                            &map,
-                            &path_memory,
-                            &elevation.0,
-                            ch.sight_range,
-                        )
-                    };
-                    tf.translation.x += bdx * step;
-                    tf.translation.y += bdy * step;
+                        let len = dist.max(0.001);
+                        tf.translation.x += (dx / len) * step;
+                        tf.translation.y += (dy / len) * step;
+                    }
+                } else {
+                    let (next_tx, next_ty) = ch.pending_path[ch.path_cursor];
+                    let twx = next_tx as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                    let twy = next_ty as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                    let dx = twx - tf.translation.x;
+                    let dy = twy - tf.translation.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < 2.0 || dist <= step {
+                        ch.path_cursor += 1;
+                    } else {
+                        let len = dist.max(0.001);
+                        tf.translation.x += (dx / len) * step;
+                        tf.translation.y += (dy / len) * step;
+                    }
                 }
             }
 
@@ -1662,7 +1475,7 @@ fn movement_system(
                             (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
                         let hy =
                             (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
-                        ch.state = AiState::MoveTo(hx, hy, false);
+                        ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                     } else {
                         ch.state = AiState::Idle;
                     }
@@ -1682,7 +1495,7 @@ fn movement_system(
                 tf.translation.x += dir_x * speed * fixed_time.delta_secs();
                 tf.translation.y += dir_y * speed * fixed_time.delta_secs();
 
-                // Hit water → abort
+                // Hit water → go home (pathfinding will find a dry route)
                 let (wtx, wty) = current_tile(&tf);
                 if wtx < MAP_WIDTH && wty < MAP_HEIGHT {
                     if matches!(
@@ -1696,7 +1509,7 @@ fn movement_system(
                                 * TILE_SIZE;
                             let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
                                 * TILE_SIZE;
-                            ch.state = AiState::MoveTo(hx, hy, false);
+                            ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                         } else {
                             ch.state = AiState::Idle;
                             ch.timer = 60.0;
@@ -1736,7 +1549,7 @@ fn movement_system(
                             * TILE_SIZE;
                         let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
                             * TILE_SIZE;
-                        ch.state = AiState::MoveTo(hx, hy, false);
+                        ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                     } else {
                         ch.state = AiState::Idle;
                         ch.timer = 60.0;
@@ -1754,7 +1567,7 @@ fn movement_system(
                             * TILE_SIZE;
                         let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
                             * TILE_SIZE;
-                        ch.state = AiState::MoveTo(hx, hy, false);
+                        ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                     } else {
                         ch.state = AiState::Idle;
                         ch.timer = 5.0;
@@ -1780,7 +1593,7 @@ fn movement_system(
                                 * TILE_SIZE;
                             let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
                                 * TILE_SIZE;
-                            ch.state = AiState::MoveTo(hx, hy, true);
+                            ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: true, path_pending: false };
                         } else {
                             ch.state = AiState::Idle;
                             ch.timer = 5.0;
@@ -1797,7 +1610,7 @@ fn movement_system(
                                 * TILE_SIZE;
                             let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
                                 * TILE_SIZE;
-                            ch.state = AiState::MoveTo(hx, hy, false);
+                            ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                             continue;
                         }
                     }
@@ -1910,7 +1723,7 @@ fn movement_system(
                                     timer: 1.0,
                                     action_tile: None,
                                     percepts: Vec::new(),
-                                    stuck_timer: 0.0,
+                                    pending_path: Vec::new(),
                                     plot_id: sid,
                                     house_id: sid,
                                     stage: LifeStage::Adult,
@@ -1921,7 +1734,8 @@ fn movement_system(
                                     marital: MaritalStatus::Married,
                                     sight_range: 8.0,
                                     food: 10,
-                                    swim_streak: 0,
+                                    path_cursor: 0,
+                                    path_pending: false,
                                 },
                                 Transform::from_xyz(cx - couple_offset, cy, 2.0),
                                 GlobalTransform::default(),
@@ -1942,7 +1756,7 @@ fn movement_system(
                                     timer: 1.5,
                                     action_tile: None,
                                     percepts: Vec::new(),
-                                    stuck_timer: 0.0,
+                                    pending_path: Vec::new(),
                                     plot_id: sid,
                                     house_id: sid,
                                     stage: LifeStage::Adult,
@@ -1953,7 +1767,8 @@ fn movement_system(
                                     marital: MaritalStatus::Married,
                                     sight_range: 8.0,
                                     food: 10,
-                                    swim_streak: 0,
+                                    path_cursor: 0,
+                                    path_pending: false,
                                 },
                                 Transform::from_xyz(cx + couple_offset, cy, 2.0),
                                 GlobalTransform::default(),
@@ -1976,7 +1791,7 @@ fn movement_system(
                                 let hy = (house.tile_y as f32
                                     + house.h as f32 / 2.0)
                                     * TILE_SIZE;
-                                ch.state = AiState::MoveTo(hx, hy, false);
+                                ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                             }
                         }
                     }
@@ -1992,6 +1807,7 @@ fn movement_system(
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // OLD character_ai removed — replaced by perception_system / decision_system / movement_system
@@ -2042,7 +1858,7 @@ pub fn action_system(
                 house_id: ch.house_id,
             });
             if let Some((hx, hy)) = home_pos {
-                ch.state = AiState::MoveTo(hx, hy, true);
+                ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: true, path_pending: false };
             } else {
                 ch.state = AiState::Idle;
             }
@@ -2289,7 +2105,7 @@ fn reproduction_system(
                 timer: 2.0,
                 action_tile: None,
                 percepts: Vec::new(),
-                stuck_timer: 0.0,
+                pending_path: Vec::new(),
                 plot_id: house.id,
                 house_id: house.id,
                 stage: LifeStage::Child,
@@ -2299,7 +2115,8 @@ fn reproduction_system(
                 marital: MaritalStatus::Single,
                 sight_range: 4.0,
                 food: 10,
-                swim_streak: 0,
+                path_cursor: 0,
+                                    path_pending: false,
             },
             Growing { age: 0.0 },
             Transform::from_xyz(hx + ox, hy + oy, 2.0),
@@ -2466,7 +2283,7 @@ fn inheritance_system(
                 timer: 1.0,
                 action_tile: None,
                 percepts: Vec::new(),
-                stuck_timer: 0.0,
+                pending_path: Vec::new(),
                 plot_id: house_id,
                 house_id,
                 stage: LifeStage::Adult,
@@ -2476,7 +2293,8 @@ fn inheritance_system(
                 marital: MaritalStatus::Widowed, // head of household — can expand
                 sight_range: 8.0,
                 food: 10,
-                swim_streak: 0,
+                path_cursor: 0,
+                                    path_pending: false,
             });
         } else {
             info!("[INHERIT] House #{}: no heir — house vacant", house_id);
@@ -2608,7 +2426,7 @@ fn child_growth_system(
             timer: 1.0,
             action_tile: None,
             percepts: Vec::new(),
-            stuck_timer: 0.0,
+            pending_path: Vec::new(),
             plot_id: house_id,
             house_id,
             stage: LifeStage::Adult,
@@ -2618,7 +2436,8 @@ fn child_growth_system(
             marital: MaritalStatus::Single,
             sight_range: 8.0,
             food: 10,
-            swim_streak: 0,
+            path_cursor: 0,
+                                    path_pending: false,
         });
 
         // Spawn new adult sprite (gender-correct)
@@ -2830,37 +2649,16 @@ impl Default for ShopLocation {
 }
 
 /// Per-tile foot-traffic wear counter (MAP_WIDTH × MAP_HEIGHT).
-/// Also tracks recently failed destinations for pathfinding avoidance.
 #[derive(Resource)]
 pub struct RoadWear {
     pub wear: Vec<u32>,
-    pub failed: Vec<bool>,
 }
 
 impl Default for RoadWear {
     fn default() -> Self {
         Self {
             wear: vec![0; MAP_WIDTH * MAP_HEIGHT],
-            failed: vec![false; MAP_WIDTH * MAP_HEIGHT],
         }
-    }
-}
-
-impl RoadWear {
-    pub fn mark_failed(&mut self, tx: usize, ty: usize) {
-        if tx < MAP_WIDTH && ty < MAP_HEIGHT {
-            self.failed[ty * MAP_WIDTH + tx] = true;
-        }
-    }
-    pub fn is_failed(&self, tx: usize, ty: usize) -> bool {
-        if tx < MAP_WIDTH && ty < MAP_HEIGHT {
-            self.failed[ty * MAP_WIDTH + tx]
-        } else {
-            false
-        }
-    }
-    pub fn clear_failed(&mut self) {
-        self.failed.fill(false);
     }
 }
 
@@ -3077,7 +2875,6 @@ fn food_diagnostics(
     chars: Query<&Character>,
     houses: Query<&House>,
     farm_tiles: Query<&FarmTile>,
-    mut road_wear: ResMut<RoadWear>,
 ) {
     let dt = fixed_time.delta_secs_f64();
     diag_timer.0 += dt;
@@ -3121,8 +2918,6 @@ fn food_diagnostics(
             );
         }
     }
-    // Clear failed destination blacklist so tiles can be retried
-    road_wear.clear_failed();
 }
 
 /// Maximum distance (pixels) a character can be from their house to access

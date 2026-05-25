@@ -11,6 +11,7 @@ mod features;
 mod generation;
 mod lang;
 mod map;
+mod pathfinding;
 mod player;
 mod resources;
 mod sim_rng;
@@ -48,6 +49,7 @@ fn main() {
         .add_plugins(map::MapPlugin)
         .add_plugins(camera::CameraPlugin)
         .add_plugins(farmland::FarmlandPlugin)
+        .add_plugins(pathfinding::PathfindingPlugin)
         .add_plugins(player::CharacterPlugin)
         .add_plugins(vegetation::VegetationPlugin)
         .add_plugins(birds::BirdPlugin)
