@@ -1241,6 +1241,7 @@ fn movement_system(
         }
 
         let speed_val = ch.speed;
+        let plot_id = ch.plot_id;
         match ch.state {
             AiState::Idle => {
                 // handled by decision_system
@@ -1249,18 +1250,20 @@ fn movement_system(
             AiState::MoveTo { target: (wx, wy), ref mut path, ref mut cursor, purposeful, ref mut path_pending } => {
                 // If path not yet requested, submit a request
                 if path.is_empty() && !*path_pending {
-                    // If already at the target tile, handle arrival immediately
+                    // If close to target and not a farm, just go idle
                     let dx = wx - pos.0;
                     let dy = wy - pos.1;
-                    if dx * dx + dy * dy < 4.0 {
+                    let dist2 = dx * dx + dy * dy;
+                    if dist2 < 4.0 {
+                        // Already at target — process arrival
                         tf.translation.x = wx;
                         tf.translation.y = wy;
                         let (tx, ty) = current_tile(&tf);
                         let is_my_farm = farm_tiles.iter().any(|(ft, _)| {
-                            ft.tile_x == tx && ft.tile_y == ty && ft.plot == ch.plot_id
+                            ft.tile_x == tx && ft.tile_y == ty && ft.plot == plot_id
                         });
                         let is_pending = pending_farmland
-                            .plots.get(&ch.plot_id)
+                            .plots.get(&plot_id)
                             .map(|tiles| tiles.contains(&(tx, ty)))
                             .unwrap_or(false);
                         if is_my_farm || is_pending {
@@ -1271,8 +1274,18 @@ fn movement_system(
                         }
                         continue;
                     }
-                    let src = current_tile(&tf);
+                    // Close to non-farm target (e.g. going home) — just idle
                     let dst_tile = ((wx / TILE_SIZE) as usize, (wy / TILE_SIZE) as usize);
+                    let is_farm = farm_tiles.iter().any(|(ft, _)| ft.tile_x == dst_tile.0 && ft.tile_y == dst_tile.1 && ft.plot == plot_id)
+                        || pending_farmland.plots.get(&plot_id)
+                            .map(|tiles| tiles.contains(&(dst_tile.0, dst_tile.1)))
+                            .unwrap_or(false);
+                    if dist2 < 160.0 * 160.0 && !is_farm {
+                        ch.state = AiState::Idle;
+                        ch.timer = 3.0;
+                        continue;
+                    }
+                    let src = current_tile(&tf);
                     queue.requests.push(PathRequest {
                         entity,
                         src_tile: src,
@@ -1304,11 +1317,11 @@ fn movement_system(
 
                         let (tx, ty) = current_tile(&tf);
                         let is_my_farm = farm_tiles.iter().any(|(ft, _)| {
-                            ft.tile_x == tx && ft.tile_y == ty && ft.plot == ch.plot_id
+                            ft.tile_x == tx && ft.tile_y == ty && ft.plot == plot_id
                         });
                         let is_pending = pending_farmland
                             .plots
-                            .get(&ch.plot_id)
+                            .get(&plot_id)
                             .map(|tiles| tiles.contains(&(tx, ty)))
                             .unwrap_or(false);
                         if is_my_farm || is_pending {
@@ -1605,14 +1618,20 @@ fn movement_system(
                         .find(|h| h.id == ch.house_id)
                         .map(|h| h.storage)
                         .unwrap_or(0);
+                    // Check if already near home — if so, just go idle
+                    let near_home = houses.iter().find(|h| h.id == ch.house_id).map(|house| {
+                        let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                        let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
+                        (pos.0 - hx).powi(2) + (pos.1 - hy).powi(2) < 160.0 * 160.0
+                    }).unwrap_or(false);
+
                     if home_food < 20 {
-                        if let Some(house) =
-                            houses.iter().find(|h| h.id == ch.house_id)
-                        {
-                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0)
-                                * TILE_SIZE;
-                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
-                                * TILE_SIZE;
+                        if near_home {
+                            ch.state = AiState::Idle;
+                            ch.timer = 5.0;
+                        } else if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
+                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
                             ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: true, path_pending: false };
                         } else {
                             ch.state = AiState::Idle;
@@ -1623,13 +1642,12 @@ fn movement_system(
 
                     // Periodic check: go home to check for farm work
                     if rand::random::<f32>() < 0.15 {
-                        if let Some(house) =
-                            houses.iter().find(|h| h.id == ch.house_id)
-                        {
-                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0)
-                                * TILE_SIZE;
-                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0)
-                                * TILE_SIZE;
+                        if near_home {
+                            ch.state = AiState::Idle;
+                            ch.timer = 3.0;
+                        } else if let Some(house) = houses.iter().find(|h| h.id == ch.house_id) {
+                            let hx = (house.tile_x as f32 + house.w as f32 / 2.0) * TILE_SIZE;
+                            let hy = (house.tile_y as f32 + house.h as f32 / 2.0) * TILE_SIZE;
                             ch.state = AiState::MoveTo { target: (hx, hy), path: Vec::new(), cursor: 0, purposeful: false, path_pending: false };
                             continue;
                         }
