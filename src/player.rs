@@ -150,19 +150,25 @@ pub struct Character {
 }
 
 impl Character {
-    fn state_desc(&self) -> String {
+    pub(crate) fn state_desc(&self) -> String {
         match &self.state {
-            AiState::Idle => format!("Idle  timer={:.1}", self.timer),
+            AiState::Idle => format!("Idle(t={:.0})", self.timer),
             AiState::MoveTo { target: (wx, wy), path, cursor, purposeful, path_pending } => {
-                let p = if *purposeful { "P" } else { "" };
-                format!("MoveTo({:.0},{:.0}){} cur={}/{} pend={}", wx, wy, p, cursor, path.len(), path_pending)
+                let p = if *purposeful { "work" } else { "walk" };
+                if path.is_empty() && *path_pending {
+                    format!("MoveTo({:.0},{:.0}) {} WAITING", wx, wy, p)
+                } else if path.is_empty() {
+                    format!("MoveTo({:.0},{:.0}) {} NO-PATH", wx, wy, p)
+                } else {
+                    format!("MoveTo({:.0},{:.0}) {} [{}/{}]", wx, wy, p, cursor, path.len())
+                }
             }
             AiState::Exploring { dir_x, dir_y, .. } => {
-                format!("Exploring dir=({:.2},{:.2})", dir_x, dir_y)
+                format!("Exploring dir=({:.1},{:.1}) food={}", dir_x, dir_y, self.food)
             }
-            AiState::GoingToShop => "GoingToShop".to_string(),
-            AiState::GoingToSocial(x, y) => format!("GoingToSocial({:.0},{:.0})", x, y),
-            AiState::Socializing => format!("Socializing timer={:.1}", self.timer),
+            AiState::GoingToShop => format!("GoingToShop food={}", self.food),
+            AiState::GoingToSocial(x, y) => format!("Social({:.0},{:.0})", x, y),
+            AiState::Socializing => format!("Socializing t={:.0}", self.timer),
         }
     }
 }
@@ -2677,22 +2683,17 @@ impl StateHistory {
         *self.timers.entry(entity).or_insert(0.0) += dt;
     }
 
-    /// Record a state entry if enough time has passed AND the state differs.
-    pub fn record(&mut self, entity: Entity, game_time: f64, desc: String) {
-        let timer = self.timers.entry(entity).or_insert(0.0);
-        if *timer < 1.0 {
-            return; // rate-limit: max 1 entry per second
-        }
-        *timer = 0.0;
-
+    /// Record a state entry (called every frame; only stores on change).
+    pub fn record(&mut self, entity: Entity, _game_time: f64, desc: String) {
         let last = self.last.entry(entity).or_default();
         if *last == desc {
-            return; // only record state changes
+            return; // only on change
         }
         *last = desc.clone();
 
         let entries = self.entries.entry(entity).or_default();
-        entries.push((game_time, desc));
+        let seq = entries.len() + 1;
+        entries.push((seq as f64, desc));
         if entries.len() > 10 {
             entries.remove(0);
         }

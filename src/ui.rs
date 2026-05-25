@@ -292,29 +292,17 @@ fn update_info_panel(
                 MaritalStatus::Married => tr("Married", l),
                 MaritalStatus::Widowed => tr("Widowed", l),
             };
+            let cur_state = ch.state_desc();
             lines.push(format!("+2.0  {} {} ({})  {}:{}  [{}]",
                 gender_str, role, tr("character", l), tr("Food", l), ch.food, marital_str));
-            // Show top 2 personality traits
-            let p = &ch.personality;
-            let mut traits = vec![
-                (tr("Openness", l), p.openness),
-                (tr("Conscientiousness", l), p.conscientiousness),
-                (tr("Extraversion", l), p.extraversion),
-                (tr("Agreeableness", l), p.agreeableness),
-                (tr("Neuroticism", l), p.neuroticism),
-            ];
-            traits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let trait_strs: Vec<String> = traits.iter().map(|(name, val)| {
-                format!("{}: {:.0}%", name, val * 100.0)
-            }).collect();
-            lines.push(format!("  {}", trait_strs.join("  |  ")));
+            lines.push(format!("  State: {}", cur_state));
 
             // State history (last 10 state transitions)
             if let Some(history) = state_history.entries.get(&entity) {
-                if !history.is_empty() {
-                    lines.push(format!("  ── {} ──", "State History"));
-                    for (i, (_t, desc)) in history.iter().rev().enumerate() {
-                        let marker = if i == 0 { "→ " } else { "  " };
+                if history.len() > 1 {
+                    lines.push(format!("  ── History (last 10) ──"));
+                    for (_i, (_t, desc)) in history.iter().rev().enumerate() {
+                        let marker = if desc == &cur_state { "● " } else { "  " };
                         lines.push(format!("  {}{}", marker, desc));
                     }
                 }
