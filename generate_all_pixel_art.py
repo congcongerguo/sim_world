@@ -1055,22 +1055,119 @@ def gen_tombstone():
     return img
 
 
-def gen_road():
-    """Road/path tile."""
+def gen_road_conn(bits):
+    """
+    Generate a road tile based on 4-bit connection mask.
+    bits: N=8, E=4, S=2, W=1
+    Background is transparent — terrain shows through.
+    """
+    n = bool(bits & 8); e = bool(bits & 4)
+    s = bool(bits & 2); w = bool(bits & 1)
     img = new_img()
-    # Base dirt
-    rect(img, 0, 8, 32, 16, (141, 110, 99, 255))
-    # Road surface
-    rect(img, 0, 10, 32, 12, (158, 130, 110, 255))
-    # Cobblestone pattern
-    for _ in range(8):
-        cx, cy = (_ * 9) % 28, 11 + (_ % 3) * 4
-        rect(img, cx, cy, 5, 3, (169, 140, 120, 255))
-        rect(img, cx + 1, cy + 1, 3, 1, (141, 110, 99, 255))
-    # Edge lines
-    hline(img, 0, 31, 10, (121, 85, 72, 255))
-    hline(img, 0, 31, 21, (121, 85, 72, 255))
+    surf_col = (158, 130, 110, 255)
+    edge_col = (121, 85, 72, 255)
+
+    # Boolean mask for road surface pixels
+    road = [[False]*32 for _ in range(32)]
+    # Center 16x16 block
+    for y in range(8, 24):
+        for x in range(8, 24):
+            road[y][x] = True
+    # Connected arms
+    if n:
+        for y in range(0, 8):
+            for x in range(8, 24):
+                road[y][x] = True
+    if s:
+        for y in range(24, 32):
+            for x in range(8, 24):
+                road[y][x] = True
+    if e:
+        for y in range(8, 24):
+            for x in range(24, 32):
+                road[y][x] = True
+    if w:
+        for y in range(8, 24):
+            for x in range(0, 8):
+                road[y][x] = True
+    # Corner fills
+    if n and e:
+        for y in range(0, 8):
+            for x in range(24, 32):
+                road[y][x] = True
+    if n and w:
+        for y in range(0, 8):
+            for x in range(0, 8):
+                road[y][x] = True
+    if s and e:
+        for y in range(24, 32):
+            for x in range(24, 32):
+                road[y][x] = True
+    if s and w:
+        for y in range(24, 32):
+            for x in range(0, 8):
+                road[y][x] = True
+
+    # Draw surface pixels
+    for y in range(32):
+        for x in range(32):
+            if road[y][x]:
+                px_set(img, x, y, surf_col)
+
+    # Edge line: 1px outline around the road shape
+    for y in range(32):
+        for x in range(32):
+            if not road[y][x]:
+                continue
+            # Check if adjacent to non-road
+            for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                ny, nx = y+dy, x+dx
+                if ny < 0 or ny >= 32 or nx < 0 or nx >= 32 or not road[ny][nx]:
+                    px_set(img, x, y, edge_col)
+                    break
+
+    # Cobblestone patches on inner surface (not edge)
+    stone = (169, 140, 120, 255)
+    stone_dark = (141, 110, 99, 255)
+    placed = 0
+    for i in range(30):
+        cx = 8 + (i * 7 + 3) % 16
+        cy = 8 + (i * 5 + 7) % 16
+        ok = True
+        for dy in range(3):
+            for dx in range(4):
+                y2, x2 = cy+dy, cx+dx
+                if y2 >= 32 or x2 >= 32 or not road[y2][x2]:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if not ok:
+            continue
+        rect(img, cx, cy, 4, 3, stone)
+        px_set(img, cx+1, cy+1, stone_dark)
+        placed += 1
+        if placed >= 4:
+            break
+
+    # Crossing center marker
+    if n and s and e and w:
+        rect(img, 14, 14, 4, 4, (141, 110, 99, 255))
+
     return img
+
+# Road variants: indexed by connection mask
+def gen_road_h():    return gen_road_conn(5)   # W+E
+def gen_road_v():    return gen_road_conn(10)  # N+S
+def gen_road_ne():   return gen_road_conn(12)  # N+E
+def gen_road_nw():   return gen_road_conn(9)   # N+W
+def gen_road_se():   return gen_road_conn(6)   # S+E
+def gen_road_sw():   return gen_road_conn(3)   # S+W
+def gen_road_tn():   return gen_road_conn(14)  # N+E+S (stem N)
+def gen_road_te():   return gen_road_conn(13)  # E+N+W (stem E)
+def gen_road_ts():   return gen_road_conn(7)   # S+E+W (stem S)
+def gen_road_tw():   return gen_road_conn(11)  # W+N+S (stem W)
+def gen_road_cross():return gen_road_conn(15)  # N+E+S+W
 
 
 def gen_farm_fallow():
@@ -1183,7 +1280,18 @@ GENERATORS = {
     # Misc
     "misc/shop.png": gen_shop,
     "misc/tombstone.png": gen_tombstone,
-    "misc/road_path.png": gen_road,
+    # Road variants (11)
+    "misc/road_h.png": gen_road_h,
+    "misc/road_v.png": gen_road_v,
+    "misc/road_ne.png": gen_road_ne,
+    "misc/road_nw.png": gen_road_nw,
+    "misc/road_se.png": gen_road_se,
+    "misc/road_sw.png": gen_road_sw,
+    "misc/road_tn.png": gen_road_tn,
+    "misc/road_te.png": gen_road_te,
+    "misc/road_ts.png": gen_road_ts,
+    "misc/road_tw.png": gen_road_tw,
+    "misc/road_cross.png": gen_road_cross,
     "misc/farm_fallow.png": gen_farm_fallow,
     "misc/farm_growing.png": gen_farm_growing,
     "misc/farm_weedy.png": gen_farm_weedy,

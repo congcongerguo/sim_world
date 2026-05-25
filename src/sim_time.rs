@@ -37,7 +37,7 @@ impl TimeScale {
     }
 
     pub fn speed_up(&mut self) {
-        let levels = [0.5, 1.0, 2.0, 4.0, 8.0];
+        let levels = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
         if let Some(next) = levels.iter().find(|&&l| l > self.speed) {
             self.speed = *next;
         }
@@ -47,7 +47,7 @@ impl TimeScale {
     }
 
     pub fn slow_down(&mut self) {
-        let levels = [0.5, 1.0, 2.0, 4.0, 8.0];
+        let levels = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
         if let Some(prev) = levels.iter().rev().find(|&&l| l < self.speed) {
             self.speed = *prev;
         }
@@ -85,7 +85,12 @@ impl Plugin for SimTimePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TimeScale>();
         app.init_resource::<SimTime>();
-        app.add_systems(Update, (advance_sim_time, time_control_input));
+        // Set fixed timestep: 20 Hz = 0.05 game-days per tick (balances perf vs smoothness)
+        let ft = Time::<Fixed>::from_hz(20.0);
+        app.insert_resource(ft);
+        app.add_systems(FixedUpdate, advance_sim_time);
+        app.add_systems(Update, time_control_input);
+        app.add_systems(Startup, startup_sync_speed);
     }
 }
 
@@ -93,18 +98,33 @@ impl Plugin for SimTimePlugin {
 // Systems
 // ---------------------------------------------------------------------------
 
-fn advance_sim_time(time: Res<Time>, scale: Res<TimeScale>, mut sim: ResMut<SimTime>) {
-    sim.elapsed += time.delta_secs_f64() * scale.speed;
+fn startup_sync_speed(mut virtual_time: ResMut<Time<Virtual>>, scale: Res<TimeScale>) {
+    virtual_time.set_relative_speed(scale.speed as f32);
 }
 
-fn time_control_input(keys: Res<ButtonInput<KeyCode>>, mut scale: ResMut<TimeScale>) {
+fn advance_sim_time(fixed_time: Res<Time<Fixed>>, mut sim: ResMut<SimTime>) {
+    sim.elapsed += fixed_time.delta_secs_f64();
+}
+
+fn time_control_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut scale: ResMut<TimeScale>,
+    mut virtual_time: ResMut<Time<Virtual>>,
+) {
+    let mut changed = false;
     if keys.just_pressed(KeyCode::Space) {
         scale.toggle_pause();
+        changed = true;
     }
     if keys.just_pressed(KeyCode::F3) {
         scale.speed_up();
+        changed = true;
     }
     if keys.just_pressed(KeyCode::F4) {
         scale.slow_down();
+        changed = true;
+    }
+    if changed {
+        virtual_time.set_relative_speed(scale.speed as f32);
     }
 }

@@ -2,9 +2,11 @@ use bevy::prelude::*;
 
 use crate::element_config::Interaction;
 use crate::farmland::{CropState, FarmTile};
+use crate::generation::ElevationMap;
 use crate::lang::{tr, GameLang};
 use crate::map::{Map, TerrainData, TileCategory, TileContent, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
-use crate::player::{Character, DeathEvents, Gender, GraveInfo, House, LifeStage, MaritalStatus};
+use crate::player::{Character, DeathEvents, Gender, GraveInfo, House, LifeStage, MaritalStatus, ShopLocation};
+use crate::sim_time::YEAR;
 use crate::sim_time::{SimTime, TimeScale};
 
 // ---------------------------------------------------------------------------
@@ -14,12 +16,19 @@ use crate::sim_time::{SimTime, TimeScale};
 #[derive(Resource, Default)]
 pub struct HoveredTile(pub Option<(usize, usize)>);
 
+/// A tile that has been clicked and "locked" for persistent display.
+#[derive(Resource, Default)]
+pub struct Selection(pub Option<(usize, usize)>);
+
 // ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
 
 #[derive(Component)]
 struct InfoText;
+
+#[derive(Component)]
+struct HouseholdSummaryText;
 
 // ---------------------------------------------------------------------------
 // Plugin
@@ -30,8 +39,9 @@ pub struct UIPlugin;
 impl Plugin for UIPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HoveredTile>();
+        app.init_resource::<Selection>();
         app.add_systems(Startup, spawn_info_panel);
-        app.add_systems(Update, (update_hovered_tile, update_info_panel));
+        app.add_systems(Update, (update_hovered_tile, update_info_panel, update_household_summary));
     }
 }
 
@@ -59,8 +69,35 @@ fn spawn_info_panel(mut commands: Commands, asset_server: Res<AssetServer>) {
                 InfoText,
                 Text::new("Hover over the map"),
                 TextFont {
-                    font: font,
+                    font: font.clone(),
                     font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+        });
+
+    // Right-side household summary panel
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                right: Val::Px(10.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(12.0)),
+                max_width: Val::Px(340.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.75)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                HouseholdSummaryText,
+                Text::new(""),
+                TextFont {
+                    font: font,
+                    font_size: 13.0,
                     ..default()
                 },
                 TextColor(Color::WHITE),
@@ -72,6 +109,8 @@ fn update_hovered_tile(
     windows: Query<&Window>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
     mut hovered: ResMut<HoveredTile>,
+    mut selection: ResMut<Selection>,
+    mouse: Res<ButtonInput<MouseButton>>,
 ) {
     let Ok(window) = windows.get_single() else {
         hovered.0 = None;
@@ -103,16 +142,34 @@ fn update_hovered_tile(
     }
 
     hovered.0 = Some((tile_x as usize, tile_y as usize));
+
+    // Left click: toggle selection on this tile
+    if mouse.just_pressed(MouseButton::Left) {
+        let pos = (tile_x as usize, tile_y as usize);
+        if selection.0 == Some(pos) {
+            selection.0 = None; // deselect on second click
+        } else {
+            selection.0 = Some(pos);
+        }
+    }
+
+    // Right click: clear selection
+    if mouse.just_pressed(MouseButton::Right) {
+        selection.0 = None;
+    }
 }
 
 fn update_info_panel(
     lang: Res<GameLang>,
     hovered: Res<HoveredTile>,
+    selection: Res<Selection>,
     map: Res<Map>,
+    elevation: Option<Res<ElevationMap>>,
     terrain_data: Res<TerrainData>,
     tile_content: Res<TileContent>,
     sim: Res<SimTime>,
     scale: Res<TimeScale>,
+    shop_location: Res<ShopLocation>,
     death_events: Res<DeathEvents>,
     house_q: Query<(&House, &Transform)>,
     char_q: Query<(&Character, &Transform)>,
@@ -145,7 +202,9 @@ fn update_info_panel(
         ));
     }
 
-    let Some((tx, ty)) = hovered.0 else {
+    // Use selected tile (locked) if set, otherwise hovered
+    let display_tile = selection.0.or(hovered.0);
+    let Some((tx, ty)) = display_tile else {
         lines.push(tr("Hover over the map", l).to_string());
         text.0 = lines.join("\n");
         return;
@@ -162,6 +221,21 @@ fn update_info_panel(
         ty,
         tr(terrain_data.names[tile_type as u8 as usize], l)
     ));
+    // Lock indicator when selection is active
+    if selection.0.is_some() {
+        lines.push(format!("  [{}]", tr("Locked", l)));
+    }
+    // Elevation display
+    if let Some(ref elev) = elevation {
+        let e = elev.0[idx];
+        let contour_band = (e * 10.0).floor() as u32;
+        lines.push(format!(
+            "  Z: {:.0}m  ({} {})",
+            e * 100.0,
+            tr("Band", l),
+            contour_band,
+        ));
+    }
     if inter != Interaction::None {
         lines.push(format!(
             "  [{}]",
@@ -217,8 +291,8 @@ fn update_info_panel(
                 MaritalStatus::Married => tr("Married", l),
                 MaritalStatus::Widowed => tr("Widowed", l),
             };
-            lines.push(format!("+2.0  {} {} ({})  [{}]",
-                gender_str, role, tr("character", l), marital_str));
+            lines.push(format!("+2.0  {} {} ({})  {}:{}  [{}]",
+                gender_str, role, tr("character", l), tr("Food", l), ch.food, marital_str));
             // Show top 2 personality traits
             let p = &ch.personality;
             let mut traits = vec![
@@ -265,6 +339,14 @@ fn update_info_panel(
         }
     }
 
+    // Shop interaction hint
+    if tx >= shop_location.tile_x && tx < shop_location.tile_x + 2
+        && ty >= shop_location.tile_y && ty < shop_location.tile_y + 2
+    {
+        lines.push(format!("+0.3  {}", tr("Village Shop", l)));
+        lines.push(format!("  [{}] {}", tr("Action", l), tr("Press C to trade", l)));
+    }
+
     for (info, tf) in grave_q.iter() {
         let gx = (tf.translation.x / TILE_SIZE).floor() as isize;
         let gy = (tf.translation.y / TILE_SIZE).floor() as isize;
@@ -274,9 +356,71 @@ fn update_info_panel(
                 Gender::Male => tr("Male", l),
                 Gender::Female => tr("Female", l),
             };
-            lines.push(format!("  {} {}  {}: #{}  {}: {:.0}", gstr, tr("Tombstone", l), tr("House", l), info.house_id, tr("Age", l), info.age));
+            lines.push(format!("  {} {}  {}: #{}  {}: {:.0}{}", gstr, tr("Tombstone", l), tr("House", l), info.house_id, tr("Age", l), info.age / YEAR, tr("years", l)));
             lines.push(format!("  {}: {}", tr("Cause", l), tr(info.cause, l)));
         }
+    }
+
+    text.0 = lines.join("\n");
+}
+
+/// Right-side panel showing all households' status at a glance.
+fn update_household_summary(
+    lang: Res<GameLang>,
+    house_q: Query<&House>,
+    char_q: Query<&Character>,
+    farm_q: Query<&FarmTile>,
+    sim: Res<SimTime>,
+    scale: Res<TimeScale>,
+    mut texts: Query<&mut Text, With<HouseholdSummaryText>>,
+) {
+    let Ok(mut text) = texts.get_single_mut() else { return };
+    let l = lang.0;
+
+    let (y, m, d) = sim.date();
+    let speed_label = if scale.speed == 0.0 {
+        tr("PAUSED", l)
+    } else {
+        "×"
+    };
+    let mut lines = Vec::new();
+    if scale.speed == 0.0 {
+        lines.push(format!("{}  {:04}-{:02}-{:02}  [{}]",
+            tr("Households", l), y, m + 1, d + 1, speed_label));
+    } else {
+        lines.push(format!("{}  {:04}-{:02}-{:02}  {}{:.1}",
+            tr("Households", l), y, m + 1, d + 1, speed_label, scale.speed));
+    }
+    lines.push(format!("──{}──", tr("─", l)));
+
+    // Collect all houses sorted by ID
+    let mut houses: Vec<&House> = house_q.iter().collect();
+    houses.sort_by_key(|h| h.id);
+
+    for house in houses {
+        let adults = char_q.iter().filter(|c| c.house_id == house.id && c.stage == LifeStage::Adult).count();
+        let children = char_q.iter().filter(|c| c.house_id == house.id && c.stage == LifeStage::Child).count();
+
+        let total_farm = farm_q.iter().filter(|ft| ft.plot == house.id).count();
+        let ready = farm_q.iter().filter(|ft| ft.plot == house.id && ft.state == CropState::Ready).count();
+        let growing = farm_q.iter().filter(|ft| ft.plot == house.id && ft.state == CropState::Growing).count();
+        let fallow = farm_q.iter().filter(|ft| ft.plot == house.id && ft.state == CropState::Fallow).count();
+        let weedy = farm_q.iter().filter(|ft| ft.plot == house.id && ft.state == CropState::Weedy).count();
+        let clearing = farm_q.iter().filter(|ft| ft.plot == house.id && ft.state == CropState::Clearing).count();
+
+        lines.push(format!(
+            "{} #{}  {}:{}  {}:{}  {}:{}  {}:{}",
+            tr("House", l), house.id,
+            tr("Food", l), house.storage,
+            tr("Ess", l), house.essentials,
+            tr("Adults", l), adults,
+            tr("Children", l), children,
+        ));
+        lines.push(format!(
+            "  {}: {}  {}:R{} G{} F{} W{} C{}",
+            tr("Farm", l), total_farm,
+            tr("Tiles", l), ready, growing, fallow, weedy, clearing,
+        ));
     }
 
     text.0 = lines.join("\n");

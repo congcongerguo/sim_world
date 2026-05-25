@@ -21,15 +21,23 @@ mod vegetation;
 use bevy::prelude::*;
 
 fn main() {
+    // Point asset path to the project root's assets/ directory
+    let asset_path: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), "assets"].iter().collect();
+
     App::new()
         .add_plugins(
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Sim World".into(),
+            DefaultPlugins
+                .set(AssetPlugin {
+                    file_path: asset_path.to_string_lossy().to_string(),
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Sim World".into(),
+                        ..default()
+                    }),
                     ..default()
                 }),
-                ..default()
-            }),
         )
         .add_plugins(sim_rng::SimRngPlugin)
         .add_plugins(actions::ActionPlugin)
@@ -42,6 +50,12 @@ fn main() {
         .add_plugins(farmland::FarmlandPlugin)
         .add_plugins(player::CharacterPlugin)
         .add_plugins(vegetation::VegetationPlugin)
+        .add_plugins(birds::BirdPlugin)
+        .add_plugins(clouds::CloudPlugin)
+        .add_plugins(caves::CavePlugin)
+        .add_plugins(resources::ResourcePlugin)
+        .add_plugins(features::FeaturePlugin)
+        .add_plugins(buildings::BuildingPlugin)
         .add_plugins(ui::UIPlugin)
         .run();
 }

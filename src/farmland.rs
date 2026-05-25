@@ -3,21 +3,37 @@ use bevy::prelude::*;
 use crate::actions::ActionEvent;
 use crate::assets::GameAssets;
 use crate::map::{Map, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
-use crate::sim_time::{TimeScale, MONTH};
 
 // ---------------------------------------------------------------------------
 // Constants — expressed in game days (1 tick ≈ 1 day, 1 month = 30 days)
 // ---------------------------------------------------------------------------
 
 /// Crop growth time (~1 month).
-const GROW_TIME: f64 = 1.0 * MONTH;
-const WEED_CHANCE: f64 = 0.35;
-/// Days to clear one tile of wild vegetation (15 days).
+const GROW_TIME: f64 = 15.0;
+const WEED_CHANCE: f64 = 0.15;
+/// Days for a fallow tile to regrow weeds if not planted (~14 years — effectively
+/// never during normal play; weeds only come from the crop-maturation chance).
+const WEED_FALLOW_TIME: f64 = 5000.0;
+/// Days to clear one tile of wild vegetation.
 pub const CLEAR_TIME: f64 = 15.0;
+/// Minimum time a crop must stay in Ready state before it can be harvested.
+/// This ensures the yellow Ready state is visible to the player even at
+/// high simulation speeds (8× default).
+pub const MIN_READY_TIME: f64 = 0.5;
 /// Number of tiles automatically spawned per plot at game start.
-const STARTER_TILES: usize = 12;
+const STARTER_TILES: usize = 6;
 /// Target number of tiles per plot (organic shape, not a fixed rectangle).
-const TARGET_PLOT_SIZE: usize = 15;
+const TARGET_PLOT_SIZE: usize = 40;
+
+/// Terrain-specific clearing time in days. Forest takes longest, dirt is fastest.
+fn clearing_time_for_terrain(t: TileType) -> f64 {
+    match t {
+        TileType::Grass | TileType::Meadow => 15.0,
+        TileType::Dirt => 10.0,
+        TileType::Forest => 30.0,
+        _ => 20.0,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Components
@@ -72,7 +88,8 @@ pub struct FarmlandPlugin;
 impl Plugin for FarmlandPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PostStartup, (setup_farm_layout, spawn_farmland).chain());
-        app.add_systems(Update, (update_crop_growth, farm_interaction));
+        // update_crop_growth 已迁移到 CharacterPlugin 的 FixedUpdate 链中
+        app.add_systems(FixedUpdate, farm_interaction);
     }
 }
 
@@ -226,8 +243,8 @@ pub fn setup_farm_layout(map: Res<Map>, mut commands: Commands) {
         let max_cx = (shop_x as isize + 3).min(MAP_WIDTH as isize - 1) as usize;
         let max_cy = (shop_y as isize + 3).min(MAP_HEIGHT as isize - 1) as usize;
 
-        for plot in plots.iter_mut() {
-            plot.retain(|(px, py)| {
+        if let Some(plot0) = plots.get_mut(0) {
+            plot0.retain(|(px, py)| {
                 !(*px >= min_cx && *px <= max_cx && *py >= min_cy && *py <= max_cy)
             });
         }
@@ -292,71 +309,56 @@ fn spawn_farmland(mut commands: Commands, layout: Res<FarmLayout>, assets: Res<G
 // Growth
 // ---------------------------------------------------------------------------
 
-fn update_crop_growth(
-    time: Res<Time>,
-    scale: Res<TimeScale>,
+pub fn update_crop_growth(
+    fixed_time: Res<Time<Fixed>>,
+    map: Res<Map>,
+    assets: Res<GameAssets>,
     mut tiles: Query<(&mut FarmTile, &mut Sprite)>,
 ) {
-    if scale.speed == 0.0 {
-        return;
-    }
+    let dt = fixed_time.delta_secs_f64();
 
-    let dt = time.delta_secs_f64() * scale.speed;
-
-    // Collect unique plots that are growing
-    let mut plot_growth: Vec<(usize, f64)> = Vec::new();
-    for (tile, _) in tiles.iter_mut() {
-        if tile.state == CropState::Growing
-            && !plot_growth.iter().any(|(p, _)| *p == tile.plot)
-        {
-            plot_growth.push((tile.plot, tile.growth));
-        }
-    }
-
-    // Advance each plot and check for ripening
-    use std::collections::HashMap;
-    let mut updates: HashMap<usize, (f64, Option<CropState>)> = HashMap::new();
-    for (plot, growth) in plot_growth.iter_mut() {
-        *growth += dt;
-        if *growth >= GROW_TIME {
-            let weedy = rand::random::<f64>() < WEED_CHANCE;
-            let state = if weedy {
-                info!("[CROP] Plot #{} → WEEDY (will need weeding)", plot);
-                CropState::Weedy
-            } else {
-                info!("[CROP] Plot #{} → READY (ready to harvest)", plot);
-                CropState::Ready
-            };
-            updates.insert(*plot, (0.0, Some(state)));
-        } else {
-            updates.insert(*plot, (*growth, None));
-        }
-    }
-
-    // Apply to all tiles
     for (mut tile, mut sprite) in tiles.iter_mut() {
-        // Handle clearing tiles — gradual colour transition
-        if tile.state == CropState::Clearing {
-            tile.growth += dt;
-            sprite.color = color_for_clearing(tile.growth / CLEAR_TIME);
-            if tile.growth >= CLEAR_TIME {
-                tile.state = CropState::Fallow;
-                tile.growth = 0.0;
-                sprite.color = Color::WHITE;
-            }
-            continue;
-        }
-
-        // Handle growing tiles
-        if let Some((growth, new_state)) = updates.get(&tile.plot) {
-            if tile.state == CropState::Growing {
-                tile.growth = *growth;
-                if let Some(state) = new_state {
-                    tile.state = *state;
+        match tile.state {
+            CropState::Clearing => {
+                tile.growth += dt;
+                let ct = clearing_time_for_terrain(map.tiles[tile.tile_y * MAP_WIDTH + tile.tile_x]);
+                sprite.color = color_for_clearing(tile.growth / ct);
+                if tile.growth >= ct {
+                    tile.state = CropState::Fallow;
                     tile.growth = 0.0;
                     sprite.color = Color::WHITE;
+                    sprite.image = assets.misc_farm_fallow.clone();
                 }
             }
+            CropState::Fallow => {
+                tile.growth += dt;
+                if tile.growth >= WEED_FALLOW_TIME {
+                    tile.state = CropState::Weedy;
+                    tile.growth = 0.0;
+                    sprite.color = Color::WHITE;
+                    sprite.image = assets.misc_farm_weedy.clone();
+                }
+            }
+            CropState::Growing => {
+                tile.growth += dt;
+                if tile.growth >= GROW_TIME {
+                    let weedy = rand::random::<f64>() < WEED_CHANCE;
+                    tile.state = if weedy {
+                        info!("[CROP] Tile ({},{}) → WEEDY", tile.tile_x, tile.tile_y);
+                        CropState::Weedy
+                    } else {
+                        info!("[CROP] Tile ({},{}) → READY", tile.tile_x, tile.tile_y);
+                        CropState::Ready
+                    };
+                    tile.growth = 0.0;
+                    sprite.color = Color::WHITE;
+                    sprite.image = farm_texture(tile.state, &assets).clone();
+                }
+            }
+            CropState::Ready => {
+                tile.growth += dt; // Track time in Ready state (for MIN_READY_TIME)
+            }
+            _ => {} // Weedy — no automatic changes
         }
     }
 }
@@ -379,15 +381,11 @@ fn farm_interaction(
         return;
     };
 
-    // Find the plot of the hovered tile
-    let plot = tiles
-        .iter()
-        .find(|t| t.tile_x == hx && t.tile_y == hy)
-        .map(|t| t.plot);
-
-    if let Some(plot_id) = plot {
+    // Only act if there's a farm tile at the hovered position
+    if tiles.iter().any(|t| t.tile_x == hx && t.tile_y == hy) {
         events.send(ActionEvent::FarmInteract {
-            plot_id,
+            tile_x: hx,
+            tile_y: hy,
             house_id: None, // manual action – no house deposit
         });
     }

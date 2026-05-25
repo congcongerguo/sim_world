@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::assets::GameAssets;
-use crate::farmland::{farm_texture, CropState, FarmTile};
+use crate::farmland::{farm_texture, CropState, FarmTile, MIN_READY_TIME};
 use crate::player::House;
 
 // Shop constants (mirrored from player.rs for action handling)
@@ -14,16 +14,22 @@ const SHOP_GAIN_ESSENTIALS: u32 = 10;
 
 #[derive(Event)]
 pub enum ActionEvent {
-    /// Toggle a farm plot's state.
+    /// Toggle a single farm tile's state.
     ///   Fallow → Growing  |  Weedy → Growing  |  Ready → Fallow (+ harvest)
     /// When `house_id` is set, harvested produce is deposited there.
     FarmInteract {
-        plot_id: usize,
+        tile_x: usize,
+        tile_y: usize,
         house_id: Option<usize>,
     },
     /// A character visits the shop to trade food for daily essentials.
     ShopTrade {
         house_id: usize,
+    },
+    /// A character emigrates to a new settlement, taking food from the old house.
+    Emigrate {
+        house_id: usize,
+        food_amount: u32,
     },
 }
 
@@ -36,7 +42,7 @@ pub struct ActionPlugin;
 impl Plugin for ActionPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<ActionEvent>();
-        app.add_systems(Update, process_action_events);
+        // process_action_events 已迁移到 CharacterPlugin 的 FixedUpdate 链中
     }
 }
 
@@ -44,7 +50,7 @@ impl Plugin for ActionPlugin {
 // Action processor – single place for all action effects
 // ---------------------------------------------------------------------------
 
-fn process_action_events(
+pub fn process_action_events(
     mut events: EventReader<ActionEvent>,
     mut farm_tiles: Query<(&mut FarmTile, &mut Sprite)>,
     mut houses: Query<&mut House>,
@@ -52,32 +58,42 @@ fn process_action_events(
 ) {
     for event in events.read() {
         match event {
-            ActionEvent::FarmInteract { plot_id, house_id } => {
-                apply_farm_interact(*plot_id, *house_id, &mut farm_tiles, &mut houses, &assets);
+            ActionEvent::FarmInteract { tile_x, tile_y, house_id } => {
+                apply_farm_interact(*tile_x, *tile_y, *house_id, &mut farm_tiles, &mut houses, &assets);
             }
             ActionEvent::ShopTrade { house_id } => {
                 apply_shop_trade(*house_id, &mut houses);
+            }
+            ActionEvent::Emigrate { house_id, food_amount } => {
+                apply_emigrate(*house_id, *food_amount, &mut houses);
             }
         }
     }
 }
 
 fn apply_farm_interact(
-    plot_id: usize,
+    tile_x: usize,
+    tile_y: usize,
     house_id: Option<usize>,
     farm_tiles: &mut Query<(&mut FarmTile, &mut Sprite)>,
     houses: &mut Query<&mut House>,
     assets: &GameAssets,
 ) {
-    // Read current state of the plot
+    // Find the specific tile
     let mut current = None;
     for (ft, _) in farm_tiles.iter() {
-        if ft.plot == plot_id {
-            current = Some(ft.state);
+        if ft.tile_x == tile_x && ft.tile_y == tile_y {
+            current = Some((ft.state, ft.plot, ft.growth));
             break;
         }
     }
-    let Some(state) = current else { return };
+    let Some((state, plot_id, growth)) = current else { return };
+
+    // Ready tiles need minimum display time before harvest
+    // (manual C-key interaction with house_id=None bypasses this)
+    if state == CropState::Ready && growth < MIN_READY_TIME && house_id.is_some() {
+        return;
+    }
 
     let was_ready = state == CropState::Ready;
     let new_state = match state {
@@ -96,37 +112,32 @@ fn apply_farm_interact(
         _ => "TOGGLE",
     };
 
-    // Apply state to every tile in the plot + swap texture
-    let new_tex = farm_texture(st, assets).clone();
+    // Apply state to this single tile + swap texture
     for (mut ft, mut sprite) in farm_tiles.iter_mut() {
-        if ft.plot != plot_id {
+        if ft.tile_x != tile_x || ft.tile_y != tile_y {
             continue;
         }
         ft.state = st;
         ft.growth = 0.0;
         sprite.color = Color::WHITE;
-        sprite.image = new_tex.clone();
+        sprite.image = farm_texture(st, assets).clone();
+        break;
     }
 
     info!(
-        "[FARM] Plot #{}: {} (by house {:?})",
-        plot_id, action_label, house_id,
+        "[FARM] Plot #{} tile ({},{}): {} (by house {:?})",
+        plot_id, tile_x, tile_y, action_label, house_id,
     );
 
-    // Harvest: deposit produce into the character's house
+    // Harvest: deposit 1 food into the character's house
     if was_ready {
         if let Some(hid) = house_id {
-            let tile_count = farm_tiles
-                .iter()
-                .filter(|(ft, _)| ft.plot == plot_id)
-                .count() as u32;
-
             for mut house in houses.iter_mut() {
                 if house.id == hid {
-                    house.storage += tile_count * 2;
+                    house.storage += 12;
                     info!(
-                        "[FARM] Plot #{} HARVEST → House #{} +{} food (storage: {})",
-                        plot_id, hid, tile_count, house.storage,
+                        "[FARM] Tile ({},{}) HARVEST → House #{} +12 food (storage: {})",
+                        tile_x, tile_y, hid, house.storage,
                     );
                     break;
                 }
@@ -151,6 +162,20 @@ fn apply_shop_trade(house_id: usize, houses: &mut Query<&mut House>) {
                     house.id, house.storage,
                 );
             }
+            break;
+        }
+    }
+}
+
+fn apply_emigrate(house_id: usize, food_amount: u32, houses: &mut Query<&mut House>) {
+    for mut house in houses.iter_mut() {
+        if house.id == house_id {
+            let actual = food_amount.min(house.storage);
+            house.storage -= actual;
+            info!(
+                "[EMIGRATE] House #{}: -{} food for new settlement (remaining: {})",
+                house_id, actual, house.storage,
+            );
             break;
         }
     }

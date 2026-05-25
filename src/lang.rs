@@ -83,6 +83,7 @@ static ZH: &[(&str, &str)] = &[
     ("Workshop", "工坊"),
     ("Well", "水井"),
     // UI strings
+    ("Shop", "商店"),
     ("Hover over the map", "悬停在地图上查看信息"),
     ("Tile", "坐标"),
     ("Elev", "海拔"),
@@ -120,12 +121,15 @@ static ZH: &[(&str, &str)] = &[
     ("farm", "农田"),
     ("Action", "操作"),
     ("Press C to interact", "按 C 键操作"),
+    ("Village Shop", "村商店"),
+    ("Press C to trade", "按 C 键交易"),
     ("Adult", "成人"),
     ("Child", "小孩"),
     ("Adults", "成人"),
     ("Children", "小孩"),
     ("Tombstone", "墓碑"),
     ("Cause", "死因"),
+    ("years", "岁"),
     ("Old Age", "寿终"),
     ("Starvation", "饿死"),
     ("Male", "男"),
@@ -138,6 +142,14 @@ static ZH: &[(&str, &str)] = &[
     ("Single", "单身"),
     ("Married", "已婚"),
     ("Widowed", "丧偶"),
+    ("Food", "食物"),
+    ("Locked", "锁定"),
+    ("Band", "层"),
+    ("Households", "各户"),
+
+    ("Ess", "日用"),
+    ("Farm", "田"),
+    ("Tiles", "地块"),
 ];
 
 // ---------------------------------------------------------------------------

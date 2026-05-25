@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 
+use crate::generation::ElevationMap;
 use crate::map::{Map, MapTileImage, MAP_WIDTH, MAP_HEIGHT};
 
 // ---------------------------------------------------------------------------
@@ -48,7 +49,8 @@ pub struct GameAssets {
     // Misc (7)
     pub misc_shop: Handle<Image>,
     pub misc_tombstone: Handle<Image>,
-    pub misc_road: Handle<Image>,
+    /// Road directional variants [h, v, ne, nw, se, sw, tn, te, ts, tw, cross]
+    pub misc_roads: [Handle<Image>; 11],
     pub misc_farm_fallow: Handle<Image>,
     pub misc_farm_growing: Handle<Image>,
     pub misc_farm_weedy: Handle<Image>,
@@ -126,7 +128,19 @@ fn load_game_assets(mut commands: Commands, asset_server: Res<AssetServer>) {
 
         misc_shop:         asset_server.load(p("misc/shop.png")),
         misc_tombstone:    asset_server.load(p("misc/tombstone.png")),
-        misc_road:         asset_server.load(p("misc/road_path.png")),
+        misc_roads: [
+            asset_server.load(p("misc/road_h.png")),     // 0=H
+            asset_server.load(p("misc/road_v.png")),     // 1=V
+            asset_server.load(p("misc/road_ne.png")),    // 2=NE
+            asset_server.load(p("misc/road_nw.png")),    // 3=NW
+            asset_server.load(p("misc/road_se.png")),    // 4=SE
+            asset_server.load(p("misc/road_sw.png")),    // 5=SW
+            asset_server.load(p("misc/road_tn.png")),    // 6=TN
+            asset_server.load(p("misc/road_te.png")),    // 7=TE
+            asset_server.load(p("misc/road_ts.png")),    // 8=TS
+            asset_server.load(p("misc/road_tw.png")),    // 9=TW
+            asset_server.load(p("misc/road_cross.png")), // 10=cross
+        ],
         misc_farm_fallow:  asset_server.load(p("misc/farm_fallow.png")),
         misc_farm_growing: asset_server.load(p("misc/farm_growing.png")),
         misc_farm_weedy:   asset_server.load(p("misc/farm_weedy.png")),
@@ -285,6 +299,7 @@ fn build_terrain_texture(
     mut images: ResMut<Assets<Image>>,
     map: Res<Map>,
     map_image: ResMut<MapTileImage>,
+    elevation: Option<Res<ElevationMap>>,
     mut done: Local<bool>,
 ) {
     if *done {
@@ -316,6 +331,41 @@ fn build_terrain_texture(
                         let n_noise = terrain_noise(px, global_py, tt);
                         let n_col = pick_color(n_noise, neighbor_pal);
                         color = lerp_color(color, n_col, blend);
+                    }
+
+                    // Elevation-based height shading: higher = brighter
+                    if let Some(ref elev) = elevation {
+                        // Bilinear interpolation of elevation within the tile
+                        // for smooth height shading and contour lines
+                        let e_nw = elev.0[y * MAP_WIDTH + x] as f32;
+                        let e_ne = elev.0[y * MAP_WIDTH + (x + 1).min(MAP_WIDTH - 1)] as f32;
+                        let e_sw = elev.0[(y + 1).min(MAP_HEIGHT - 1) * MAP_WIDTH + x] as f32;
+                        let e_se = elev.0[(y + 1).min(MAP_HEIGHT - 1) * MAP_WIDTH + (x + 1).min(MAP_WIDTH - 1)] as f32;
+
+                        let fx = tx as f32 / TILE_PX as f32;
+                        let fy = ty as f32 / TILE_PX as f32;
+                        let e_top = e_nw + (e_ne - e_nw) * fx;
+                        let e_bot = e_sw + (e_se - e_sw) * fx;
+                        let e = e_top + (e_bot - e_top) * fy;
+
+                        // Height shading
+                        let brightness = 1.0 + (e - 0.4).max(0.0).min(0.6) * 0.35;
+                        color = (
+                            (color.0 as f32 * brightness).min(255.0) as u8,
+                            (color.1 as f32 * brightness).min(255.0) as u8,
+                            (color.2 as f32 * brightness).min(255.0) as u8,
+                        );
+
+                        // Contour lines at every 0.10 elevation interval
+                        // Use fractional part within each band to draw thin lines
+                        let band_pos = (e * 10.0).fract();
+                        if band_pos < 0.04 {
+                            color = (
+                                (color.0 as f32 * 0.75) as u8,
+                                (color.1 as f32 * 0.75) as u8,
+                                (color.2 as f32 * 0.75) as u8,
+                            );
+                        }
                     }
 
                     let di = ((dst_y_base + ty) * out_w + x as u32 * TILE_PX + tx) as usize * 4;

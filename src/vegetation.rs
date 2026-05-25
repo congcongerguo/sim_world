@@ -2,9 +2,20 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
 use crate::assets::GameAssets;
-use crate::element_config::{Interaction, VEGETATION_CONFIGS, VEG_SPAWN_RULES};
-use crate::map::{Map, TileCategory, TileContent, TileEntry, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
+use crate::element_config::{Interaction, VegSpawnRule, VEGETATION_CONFIGS, VEG_SPAWN_RULES};
+use crate::map::{Map, TileCategory, TileContent, TileEntry, TileType, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT};
 use crate::sim_rng::SimRng;
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+/// Per-tile boolean mask: true if at least one tree (DeciduousTree, PineTree,
+/// or PalmTree) occupies this tile.  Used by character AI for exploration and
+/// settlement founding.  Built once at startup and kept in sync if trees are
+/// ever chopped down.
+#[derive(Resource, Default)]
+pub struct TreeMask(pub Vec<bool>);
 
 // ---------------------------------------------------------------------------
 // Vegetation kinds
@@ -71,20 +82,28 @@ fn spawn_vegetation(
     mut tile_content: ResMut<TileContent>,
     assets: Res<GameAssets>,
 ) {
+    let mut tree_mask = vec![false; MAP_WIDTH * MAP_HEIGHT];
+
+    // Pre-group rules by terrain type: for each TileType, list of applicable rules
+    let mut terrain_rules: [Vec<&VegSpawnRule>; TileType::VARIANT_COUNT] =
+        std::array::from_fn(|_| Vec::new());
     for rule in VEG_SPAWN_RULES {
-        for y in 0..MAP_HEIGHT {
-            for x in 0..MAP_WIDTH {
-                let tile = map.tiles[y * MAP_WIDTH + x];
-                if !rule.terrain.contains(&tile) {
-                    continue;
-                }
+        for &tt in rule.terrain {
+            terrain_rules[tt as u8 as usize].push(rule);
+        }
+    }
+
+    // Single tile pass: check all applicable rules per tile
+    for y in 0..MAP_HEIGHT {
+        for x in 0..MAP_WIDTH {
+            let tile_type = map.tiles[y * MAP_WIDTH + x] as u8 as usize;
+            for rule in &terrain_rules[tile_type] {
                 if rng.gen_f64() >= rule.chance {
                     continue;
                 }
 
                 let cfg = &VEGETATION_CONFIGS[rule.kind as u8 as usize];
 
-                // Slight random offset so vegetation doesn't look grid-aligned
                 let ox = (rng.gen_f64() - 0.5) * 6.0_f64;
                 let oy = (rng.gen_f64() - 0.5) * 6.0_f64;
                 let world_x = x as f32 * TILE_SIZE + TILE_SIZE / 2.0 + ox as f32;
@@ -115,7 +134,15 @@ fn spawn_vegetation(
                     w: 1,
                     h: 1,
                 });
+
+                if matches!(rule.kind,
+                    VegetationKind::DeciduousTree | VegetationKind::PineTree | VegetationKind::PalmTree
+                ) {
+                    tree_mask[y * MAP_WIDTH + x] = true;
+                }
             }
         }
     }
+
+    commands.insert_resource(TreeMask(tree_mask));
 }

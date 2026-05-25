@@ -52,15 +52,15 @@ fn spawn_birds(mut commands: Commands, mut rng: ResMut<SimRng>) {
 
 fn animate_birds(
     time: Res<Time>,
-    mut birds: Query<(&Bird, &mut Transform)>,
+    mut birds: Query<(&mut Bird, &mut Transform)>,
 ) {
     let dt = time.delta_secs();
 
-    for (bird, mut tf) in birds.iter_mut() {
-        let new_phase = bird.phase + dt * bird.speed;
+    for (mut bird, mut tf) in birds.iter_mut() {
+        bird.phase += dt * bird.speed;
 
-        let dx = new_phase.cos() * bird.radius;
-        let dy = (new_phase * 0.7).sin() * bird.radius * 0.4;
+        let dx = bird.phase.cos() * bird.radius;
+        let dy = (bird.phase * 0.7).sin() * bird.radius * 0.4;
 
         tf.translation.x = bird.base_x + dx;
         tf.translation.y = bird.base_y + dy;

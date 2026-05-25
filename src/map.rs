@@ -37,6 +37,10 @@ pub enum TileType {
     Clay = 14,
 }
 
+impl TileType {
+    pub const VARIANT_COUNT: usize = 15;
+}
+
 /// Marks the single terrain sprite entity.
 #[derive(Component)]
 pub struct MapSurface;
@@ -75,17 +79,17 @@ impl Map {
 /// never reads the config tables afterwards.
 #[derive(Resource)]
 pub struct TerrainData {
-    pub names: [&'static str; 15],
-    pub interactions: [Interaction; 15],
+    pub names: [&'static str; TileType::VARIANT_COUNT],
+    pub interactions: [Interaction; TileType::VARIANT_COUNT],
     /// Pre-computed RGBA bytes (sRGB) for each TileType.
-    pub rgbs: [[u8; 4]; 15],
+    pub rgbs: [[u8; 4]; TileType::VARIANT_COUNT],
 }
 
 impl TerrainData {
     pub fn bake() -> Self {
-        let mut names = [""; 15];
-        let mut interactions = [Interaction::None; 15];
-        let mut rgbs = [[0u8; 4]; 15];
+        let mut names = [""; TileType::VARIANT_COUNT];
+        let mut interactions = [Interaction::None; TileType::VARIANT_COUNT];
+        let mut rgbs = [[0u8; 4]; TileType::VARIANT_COUNT];
         for cfg in TERRAIN_CONFIGS {
             let i = cfg.tile_type as u8 as usize;
             names[i] = cfg.name_en;
